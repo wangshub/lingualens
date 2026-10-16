@@ -1,0 +1,30 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', sans-serif;
+}
+
+@layer base {
+  :root { color-scheme: light; font-size: 15px; }
+  body { @apply m-0 bg-slate-50 font-sans text-slate-900 antialiased; line-height: 1.65; }
+  button, input, textarea, select { font: inherit; }
+  button, a, input, textarea, select { outline-offset: 3px; }
+  button:focus-visible, a:focus-visible { outline: 2px solid #2563eb; }
+  button { cursor: pointer; }
+  button:disabled { cursor: not-allowed; }
+}
+
+@layer components {
+  .btn { @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition duration-150 hover:border-slate-300 hover:bg-slate-50 active:translate-y-px disabled:opacity-50; }
+  .btn-primary { @apply border-blue-600 bg-blue-600 text-white hover:border-blue-700 hover:bg-blue-700; }
+  .field { @apply block min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 transition focus:border-blue-500 focus:outline-none focus:ring-3 focus:ring-blue-100; }
+  .field-label { @apply mb-1.5 block text-sm font-medium text-slate-800; }
+  .helper { @apply mt-1.5 text-sm text-slate-500; }
+  .feedback { @apply flex items-start gap-2 rounded-lg border px-3 py-2.5 text-sm; animation: settle .2s ease-out; }
+  .panel { @apply rounded-xl border border-slate-200 bg-white; }
+  .icon-btn { @apply inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900; }
+  .entrance { animation: settle .3s ease-out both; }
+}
+
+@keyframes settle { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

@@ -1,0 +1,15 @@
+node_modules/
+.output/
+.wxt/
+dist/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+coverage/
+playwright-report/
+test-results/
+artifacts/
+*.log
+.DS_Store

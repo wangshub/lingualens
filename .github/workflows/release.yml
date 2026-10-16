@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify tag matches package version
+        run: node scripts/check-version.mjs
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - name: Build and zip
+        run: pnpm exec wxt zip
+      - name: Verify generated manifest version
+        run: node scripts/check-version.mjs --manifest
+      - name: Keep zip for the publishing job
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-release-zip
+          path: .output/*-chrome.zip
+          if-no-files-found: error
+      - name: Create GitHub Release with automatic changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" .output/*-chrome.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" .output/*-chrome.zip --verify-tag --generate-notes --title "LinguaLens $GITHUB_REF_NAME"
+          fi
+
+  webstore:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Chrome Web Store secrets
+        id: credentials
+        env:
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+        run: |
+          if [ -n "$CHROME_EXTENSION_ID" ] && [ -n "$CHROME_CLIENT_ID" ] && [ -n "$CHROME_CLIENT_SECRET" ] && [ -n "$CHROME_REFRESH_TOKEN" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Chrome Web Store publishing skipped: configure all four CHROME_* repository secrets."
+            echo "### Chrome Web Store publishing skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "GitHub Release was created. Configure the four CHROME_* secrets documented in README, then rerun this job." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.credentials.outputs.ready == 'true'
+      - uses: pnpm/action-setup@v4
+        if: steps.credentials.outputs.ready == 'true'
+      - uses: actions/setup-node@v4
+        if: steps.credentials.outputs.ready == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+      - if: steps.credentials.outputs.ready == 'true'
+        run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        if: steps.credentials.outputs.ready == 'true'
+        with:
+          name: chrome-release-zip
+          path: .output
+      - name: Upload and submit for Chrome Web Store review
+        if: steps.credentials.outputs.ready == 'true'
+        run: pnpm exec wxt submit --chrome-zip .output/*-chrome.zip
+        env:
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
