@@ -21,6 +21,7 @@ function server(...responses) {
   });
 }
 const token = () => json({ access_token: 'test-access-token' });
+const published = () => json({ publishedItemRevisionStatus: { state: 'PUBLISHED' } });
 let directory;
 let zipPath;
 beforeAll(async () => {
@@ -51,7 +52,7 @@ describe('Chrome Web Store V2 publishing', () => {
   });
 
   it('uploads the ZIP to V2 and submits for normal review only after success', async () => {
-    const fetchImpl = server(token(), json({}), json({ uploadState: 'SUCCEEDED' }), json({ state: 'PENDING_REVIEW' }));
+    const fetchImpl = server(token(), published(), json({ uploadState: 'SUCCEEDED' }), json({ state: 'PENDING_REVIEW' }));
     expect(await runWebstore({ env, zipPath, fetchImpl })).toEqual({ checked: false, state: 'PENDING_REVIEW' });
     expect(fetchImpl.mock.calls[2][0]).toBe(api.replace('/v2/', '/upload/v2/') + ':upload');
     expect(fetchImpl.mock.calls[2][1].body).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
@@ -60,7 +61,7 @@ describe('Chrome Web Store V2 publishing', () => {
   });
 
   it.each(['IN_PROGRESS', 'UPLOAD_IN_PROGRESS'])('waits for asynchronous upload state %s', async (uploadState) => {
-    const fetchImpl = server(token(), json({}), json({ uploadState }), json({ lastAsyncUploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'SUCCEEDED' }), json({ state: 'PENDING_REVIEW' }));
+    const fetchImpl = server(token(), published(), json({ uploadState }), json({ lastAsyncUploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'SUCCEEDED' }), json({ state: 'PENDING_REVIEW' }));
     const wait = vi.fn().mockResolvedValue(undefined);
     await runWebstore({ env, zipPath, fetchImpl, wait });
     expect(wait).toHaveBeenCalledTimes(2);
@@ -74,14 +75,26 @@ describe('Chrome Web Store V2 publishing', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it('accepts a read-only lookup without claiming missing revision fields mean no submission', async () => {
+    const fetchImpl = server(token(), json({ itemId: env.CHROME_EXTENSION_ID, name: 'test-item', publicKey: 'synthetic-public-key' }));
+    expect(await runWebstore({ env, checkOnly: true, fetchImpl })).toEqual({ checked: true, published: undefined, submitted: undefined });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([{}, { submittedItemRevisionStatus: { state: 'UNKNOWN_NEW_STATE' } }])('stops before uploading when revision status cannot be confirmed: %j', async (revision) => {
+    const fetchImpl = server(token(), json({ itemId: env.CHROME_EXTENSION_ID, ...revision }));
+    await expect(runWebstore({ env, zipPath, fetchImpl })).rejects.toThrow('本次未上传文件');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it.each(['FAILED', 'NOT_FOUND', 'UNEXPECTED'])('does not submit after unsuccessful upload %s', async (uploadState) => {
-    const fetchImpl = server(token(), json({}), json({ uploadState }));
+    const fetchImpl = server(token(), published(), json({ uploadState }));
     await expect(runWebstore({ env, zipPath, fetchImpl })).rejects.toThrow('本次没有提交审核');
     expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
   it('bounds asynchronous polling and never repeats the upload', async () => {
-    const fetchImpl = server(token(), json({}), json({ uploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'IN_PROGRESS' }));
+    const fetchImpl = server(token(), published(), json({ uploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'IN_PROGRESS' }));
     await expect(runWebstore({ env, zipPath, fetchImpl, wait: vi.fn(), maxPolls: 2 })).rejects.toThrow('仍在处理中');
     expect(fetchImpl.mock.calls.filter(([url]) => url.endsWith(':upload'))).toHaveLength(1);
     expect(fetchImpl.mock.calls.some(([url]) => url.endsWith(':publish'))).toBe(false);

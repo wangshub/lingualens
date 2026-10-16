@@ -82,7 +82,7 @@ npm version patch && git push --follow-tags
 
 推送 tag 后，工作流运行检查和 `wxt zip`，创建带自动 changelog 和 zip 附件的 GitHub Release。五项 Secret 配置齐全时，`scripts/chrome-webstore.mjs` 交换短期 access token，通过 V2 上传 ZIP、等待处理完成，再提交审核。脚本不会取消现有待审核或待发布版本；如存在这类提交，会停止并提示去控制台处理。五项 Secret 缺失时，GitHub Release 仍生成，商店步骤会显示跳过原因。
 
-需要先核验认证和发布者归属时，在已安全注入五项环境变量的终端运行 `pnpm webstore --check`。此命令只交换令牌并查询状态，不上传文件或提交审核。它不会从 GitHub 读取 Secrets 的明文。
+需要先核验认证和发布者归属时，在已安全注入五项环境变量的终端运行 `pnpm webstore --check`。此命令只交换令牌并查询状态，不上传文件或提交审核。它不会从 GitHub 读取 Secrets 的明文。API 可能只返回扩展标识而不返回版本状态，CLI 会明确显示“未返回状态”，上传流程会停止并提示去控制台核对首次审核；不能据此判断没有待审版本。
 
 首次只发布 GitHub v1.0.0 时，可执行 `git tag v1.0.0 && git push origin v1.0.0`。如果商店已手动上传相同版本，应先递增版本号再运行自动提交，以免重复上传版本被拒绝。
 

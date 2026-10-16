@@ -76,6 +76,12 @@ export async function runWebstore({ env = process.env, zipPath, checkOnly = fals
   // Never cancel or overwrite a submission that the user is already waiting for.
   const pending = status.submittedItemRevisionStatus?.state;
   if (pending === 'PENDING_REVIEW' || pending === 'STAGED') throw new Error('当前扩展仍在审核或等待发布，请先在商店控制台处理现有提交。');
+  const published = status.publishedItemRevisionStatus?.state;
+  // A successful lookup can contain only itemId/name/publicKey. Missing revision
+  // fields do not establish that a manually submitted version is safe to replace.
+  if ((!itemStates.has(published) && !itemStates.has(pending)) || (pending && !itemStates.has(pending))) {
+    throw new Error('商店未返回可确认的版本状态，请先在开发者控制台核对首个版本的审核或发布情况；本次未上传文件。');
+  }
   let upload = await requestJSON(fetchImpl, `${apiOrigin}/upload/v2/${resource}:upload`, {
     method: 'POST', headers: { ...headers, 'Content-Type': 'application/zip' }, body: zip,
   }, '上传插件');
@@ -106,8 +112,8 @@ async function main() {
   if (args.length !== 1 || (args[0].startsWith('--') && args[0] !== '--check')) throw new Error('参数无效，请使用 --help 查看用法。');
   const result = await runWebstore({ zipPath: args[0], checkOnly: args[0] === '--check' });
   if (result.checked) {
-    const published = itemStates.has(result.published) ? result.published : '无已发布版本';
-    const submitted = itemStates.has(result.submitted) ? result.submitted : '无待发布版本';
+    const published = itemStates.has(result.published) ? result.published : '未返回版本状态';
+    const submitted = itemStates.has(result.submitted) ? result.submitted : '未返回提交状态';
     console.log(`Chrome Web Store V2 连接正常。已发布：${published}；提交状态：${submitted}。`);
   } else console.log(`Chrome Web Store 返回状态：${result.state}。最终发布以商店审核结果为准。`);
 }

@@ -5,10 +5,12 @@
 ## 2026-10-17 发布 CLI 与 V2 API
 
 - 新发布脚本直接使用 Chrome Web Store V2，保留用户 OAuth 客户端和 refresh token 认证，增加 V2 必需的 Publisher ID 配置。Google 公布的 [V1 支持截止日](https://developer.chrome.com/docs/webstore/api/v1) 为 2026-10-15；原 WXT 发布依赖仍调用 V1，因此 CI 改为运行独立脚本。
-- 类型检查、Lint、57 项单元测试和生产构建通过。新增 20 项测试使用模拟响应与虚构凭据，覆盖只读状态检查、异步上传轮询、失败后停止提交、保护现有审核、认证错误及凭据保密。
+- 类型检查、Lint、60 项单元测试和生产构建通过。发布工具的 23 项测试使用模拟响应与虚构凭据，覆盖只读状态检查、异步上传轮询、失败后停止提交、保护现有审核、缺少版本状态时停止上传、认证错误及凭据保密。
 - 两个 CLI 的 `--help` 可运行，工作流 YAML 语法检查通过。凭据导入工具从权限为 `600` 的 gcloud 用户 ADC 文件读取三项 OAuth 值，通过标准输入调用 `gh secret set`。
 - 本机安装 Google Cloud CLI 589.0.0，位置为未入库的 `artifacts/tools/google-cloud-sdk/`。完整归档经长度、gzip 完整性校验后解压，`gcloud --version` 与授权命令帮助可运行；隔离配置中的账号列表为空。核对 SDK 源码后，CLI 示例采用受支持的浏览器流程及所需 scope，没有使用已被 SDK 拒绝的自有客户端与 `--no-launch-browser` 组合。
-- 用户已创建商店条目并反馈状态为待审核。目前尚未创建 OAuth 客户端，V2 的真实认证、上传及提交审核均未执行。本轮未重复运行插件的浏览器交互测试。
+- 已使用用户提供的客户端完成真实 Google OAuth 授权、refresh token 续期及 V2 只读查询，五项 GitHub Secrets 已配置。实际 CLI 在本机直连 Google 失败后，通过临时本机代理重试成功；凭据只在受限文件和进程内存中读取。
+- 本次商店查询返回 `itemId`、`name` 和 `publicKey`，没有版本状态字段，不能据此判断没有待审版本。只读 CLI 明确显示“未返回状态”；上传流程遇到这种响应时会停止，要求先在控制台核对首次审核。
+- Google 本次返回 refresh token 有效期 604799 秒，约 7 天。长期自动发布仍需确认 OAuth 项目为 In production 后重新授权。用户已反馈商店条目待审核；本轮没有执行真实 ZIP 上传、提交审核或重复运行插件浏览器交互测试。
 
 ## v1.1.0 缓存与双语验证
 
