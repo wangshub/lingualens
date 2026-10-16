@@ -13,6 +13,8 @@
     "dev": "wxt",
     "build": "wxt build",
     "zip": "wxt zip",
+    "webstore": "node scripts/chrome-webstore.mjs",
+    "webstore:credentials": "node scripts/store-webstore-credentials.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",

@@ -57,22 +57,27 @@ jobs:
   webstore:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: chrome-web-store-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - name: Check Chrome Web Store secrets
         id: credentials
         env:
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
           CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
           CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
           CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
         run: |
-          if [ -n "$CHROME_EXTENSION_ID" ] && [ -n "$CHROME_CLIENT_ID" ] && [ -n "$CHROME_CLIENT_SECRET" ] && [ -n "$CHROME_REFRESH_TOKEN" ]; then
+          if [ -n "$CHROME_EXTENSION_ID" ] && [ -n "$CHROME_PUBLISHER_ID" ] && [ -n "$CHROME_CLIENT_ID" ] && [ -n "$CHROME_CLIENT_SECRET" ] && [ -n "$CHROME_REFRESH_TOKEN" ]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
           else
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Chrome Web Store publishing skipped: configure all four CHROME_* repository secrets."
+            echo "::warning::Chrome Web Store publishing skipped: configure CHROME_EXTENSION_ID, CHROME_PUBLISHER_ID and the three CHROME_* OAuth secrets."
             echo "### Chrome Web Store publishing skipped" >> "$GITHUB_STEP_SUMMARY"
-            echo "GitHub Release was created. Configure the four CHROME_* secrets documented in README, then rerun this job." >> "$GITHUB_STEP_SUMMARY"
+            echo "GitHub Release was created. Configure the five CHROME_* secrets documented in docs/RELEASING.md, then rerun this job." >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/checkout@v4
         if: steps.credentials.outputs.ready == 'true'
@@ -90,11 +95,12 @@ jobs:
         with:
           name: chrome-release-zip
           path: .output
-      - name: Upload and submit for Chrome Web Store review
+      - name: Upload and submit with Chrome Web Store API V2
         if: steps.credentials.outputs.ready == 'true'
-        run: pnpm exec wxt submit --chrome-zip .output/*-chrome.zip
+        run: node scripts/chrome-webstore.mjs .output/*-chrome.zip
         env:
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
           CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
           CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
           CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}

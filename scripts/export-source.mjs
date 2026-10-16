@@ -2,7 +2,7 @@ import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 // A reproducible delivery document containing complete source, not excerpts.
-const roots = ['package.json', 'wxt.config.ts', 'tsconfig.json', 'eslint.config.js', 'vitest.config.ts', 'playwright.config.ts', '.gitignore', 'entrypoints', 'components', 'utils', 'types', 'assets', '.github/workflows', 'scripts/check-version.mjs', 'scripts/generate-icons.mjs', 'tests', 'LICENSE'];
+const roots = ['package.json', 'wxt.config.ts', 'tsconfig.json', 'eslint.config.js', 'vitest.config.ts', 'playwright.config.ts', '.gitignore', 'entrypoints', 'components', 'utils', 'types', 'assets', '.github/workflows', 'scripts', 'tests', 'LICENSE'];
 async function files(path) {
   try {
     const entries = await readdir(path, { withFileTypes: true });

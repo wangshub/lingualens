@@ -2,6 +2,14 @@
 
 日期：2026-10-16。环境：Node.js 22.22.0、pnpm 10.15.1、WXT 0.20.27、TypeScript 5.9.3、React 19.3.1、Tailwind CSS 4.3.3、Playwright Chromium 156.0.8078.4。
 
+## 2026-10-17 发布 CLI 与 V2 API
+
+- 新发布脚本直接使用 Chrome Web Store V2，保留用户 OAuth 客户端和 refresh token 认证，增加 V2 必需的 Publisher ID 配置。Google 公布的 [V1 支持截止日](https://developer.chrome.com/docs/webstore/api/v1) 为 2026-10-15；原 WXT 发布依赖仍调用 V1，因此 CI 改为运行独立脚本。
+- 类型检查、Lint、57 项单元测试和生产构建通过。新增 20 项测试使用模拟响应与虚构凭据，覆盖只读状态检查、异步上传轮询、失败后停止提交、保护现有审核、认证错误及凭据保密。
+- 两个 CLI 的 `--help` 可运行，工作流 YAML 语法检查通过。凭据导入工具从权限为 `600` 的 gcloud 用户 ADC 文件读取三项 OAuth 值，通过标准输入调用 `gh secret set`。
+- 本机安装 Google Cloud CLI 589.0.0，位置为未入库的 `artifacts/tools/google-cloud-sdk/`。完整归档经长度、gzip 完整性校验后解压，`gcloud --version` 与授权命令帮助可运行；隔离配置中的账号列表为空。核对 SDK 源码后，CLI 示例采用受支持的浏览器流程及所需 scope，没有使用已被 SDK 拒绝的自有客户端与 `--no-launch-browser` 组合。
+- 用户已创建商店条目并反馈状态为待审核。目前尚未创建 OAuth 客户端，V2 的真实认证、上传及提交审核均未执行。本轮未重复运行插件的浏览器交互测试。
+
 ## v1.1.0 缓存与双语验证
 
 新增原文、译文和双语对照三种显示方式，页面内保留已完成译文。缓存按配置、服务地址、模型、目标语言和 Prompt 区分；取消时保留完成的段落，重新翻译或页面卸载时清除数据。
@@ -57,6 +65,6 @@ pnpm test:e2e
 
 没有使用用户真实 API Key 调用 OpenAI、DeepSeek、Moonshot 或 Ollama；不声称已验证这些服务当前的账号访问权限或实际翻译质量。协议、传输及界面已使用模拟兼容服务测试。
 
-没有 Chrome Web Store 开发者条目和四项发布凭据，因此未实际上传或上架商店。README 包含凭据申请、Secrets 配置和首次上传步骤。GitHub 远端 CI 状态以仓库 Actions 为准。
+初始验证时尚无 Chrome Web Store 开发者条目和发布凭据，因此未执行自动商店上传。后续条目与发布工具状态见本文最新记录。GitHub 远端 CI 状态以仓库 Actions 为准。
 
 静态扫描只处理当前文档内已渲染文本；不覆盖 Shadow DOM、伪元素、图片文字、Canvas 或浏览器 PDF 阅读器。应用框架重新生成的文本不强行覆盖，详见 [配置指南](CONFIGURATION.md)。

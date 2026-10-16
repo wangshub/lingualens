@@ -20,6 +20,8 @@
     "dev": "wxt",
     "build": "wxt build",
     "zip": "wxt zip",
+    "webstore": "node scripts/chrome-webstore.mjs",
+    "webstore:credentials": "node scripts/store-webstore-credentials.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
@@ -127,7 +129,7 @@ export default tseslint.config(
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
-  test: { environment: 'jsdom', include: ['tests/**/*.test.ts'], restoreMocks: true },
+  test: { environment: 'jsdom', include: ['tests/**/*.test.ts', 'tests/**/*.test.mjs'], restoreMocks: true },
 });
 ````
 
@@ -1864,22 +1866,27 @@ jobs:
   webstore:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: chrome-web-store-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - name: Check Chrome Web Store secrets
         id: credentials
         env:
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
           CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
           CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
           CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
         run: |
-          if [ -n "$CHROME_EXTENSION_ID" ] && [ -n "$CHROME_CLIENT_ID" ] && [ -n "$CHROME_CLIENT_SECRET" ] && [ -n "$CHROME_REFRESH_TOKEN" ]; then
+          if [ -n "$CHROME_EXTENSION_ID" ] && [ -n "$CHROME_PUBLISHER_ID" ] && [ -n "$CHROME_CLIENT_ID" ] && [ -n "$CHROME_CLIENT_SECRET" ] && [ -n "$CHROME_REFRESH_TOKEN" ]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
           else
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Chrome Web Store publishing skipped: configure all four CHROME_* repository secrets."
+            echo "::warning::Chrome Web Store publishing skipped: configure CHROME_EXTENSION_ID, CHROME_PUBLISHER_ID and the three CHROME_* OAuth secrets."
             echo "### Chrome Web Store publishing skipped" >> "$GITHUB_STEP_SUMMARY"
-            echo "GitHub Release was created. Configure the four CHROME_* secrets documented in README, then rerun this job." >> "$GITHUB_STEP_SUMMARY"
+            echo "GitHub Release was created. Configure the five CHROME_* secrets documented in docs/RELEASING.md, then rerun this job." >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/checkout@v4
         if: steps.credentials.outputs.ready == 'true'
@@ -1897,11 +1904,12 @@ jobs:
         with:
           name: chrome-release-zip
           path: .output
-      - name: Upload and submit for Chrome Web Store review
+      - name: Upload and submit with Chrome Web Store API V2
         if: steps.credentials.outputs.ready == 'true'
-        run: pnpm exec wxt submit --chrome-zip .output/*-chrome.zip
+        run: node scripts/chrome-webstore.mjs .output/*-chrome.zip
         env:
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
           CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
           CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
           CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
@@ -1927,6 +1935,154 @@ if (process.argv.includes('--manifest')) {
 console.log(`Version verified: ${pkg.version}`);
 ````
 
+## scripts/chrome-webstore.mjs
+
+````js
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const apiOrigin = 'https://chromewebstore.googleapis.com';
+const tokenEndpoint = 'https://oauth2.googleapis.com/token';
+const required = ['CHROME_EXTENSION_ID', 'CHROME_PUBLISHER_ID', 'CHROME_CLIENT_ID', 'CHROME_CLIENT_SECRET', 'CHROME_REFRESH_TOKEN'];
+const submissionStates = new Set(['PENDING_REVIEW', 'STAGED', 'PUBLISHED', 'PUBLISHED_TO_TESTERS']);
+const itemStates = new Set([...submissionStates, 'REJECTED', 'CANCELLED']);
+
+/** Keep OAuth values in memory. Never include API response bodies in logs/errors. */
+export function webstoreConfig(env) {
+  const missing = required.filter((key) => !env[key]?.trim());
+  if (missing.length) throw new Error(`缺少发布配置：${missing.join(', ')}`);
+  const config = Object.fromEntries(required.map((key) => [key, env[key].trim()]));
+  if (!/^[a-p]{32}$/.test(config.CHROME_EXTENSION_ID)) throw new Error('CHROME_EXTENSION_ID 应为 32 位 a–p 字母。');
+  if (!/^[A-Za-z0-9_-]+$/.test(config.CHROME_PUBLISHER_ID)) throw new Error('CHROME_PUBLISHER_ID 格式无效，请从商店发布者设置复制。');
+  return config;
+}
+
+async function requestJSON(fetchImpl, url, init, label) {
+  let response;
+  try {
+    response = await fetchImpl(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(60_000) });
+  } catch {
+    throw new Error(`${label}网络连接失败或超时，请稍后重试。`);
+  }
+  let data;
+  try { data = await response.json(); } catch { throw new Error(`${label}返回了无法解析的响应（HTTP ${response.status}）。`); }
+  if (!response.ok || data?.error) {
+    if (data?.error === 'invalid_grant') throw new Error('Google 授权已失效，请重新获取 CHROME_REFRESH_TOKEN。');
+    if (data?.error === 'invalid_client') throw new Error('OAuth 客户端验证失败，请检查 CHROME_CLIENT_ID 和 CHROME_CLIENT_SECRET。');
+    if (response.status === 401) throw new Error(`${label}认证失败，请检查 Google OAuth 凭据。`);
+    if (response.status === 403) throw new Error(`${label}权限不足，请确认已启用 Chrome Web Store API，且授权账号拥有该扩展的发布权限。`);
+    if (response.status === 404) throw new Error(`${label}未找到扩展，请检查 CHROME_PUBLISHER_ID 与 CHROME_EXTENSION_ID。`);
+    throw new Error(`${label}失败（HTTP ${response.status}），请查看商店控制台。`);
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(`${label}返回的响应格式无效。`);
+  return data;
+}
+
+/** Exchange the existing user OAuth credentials for a short-lived V2 bearer token. */
+export async function refreshAccessToken(config, fetchImpl = fetch) {
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: config.CHROME_CLIENT_ID,
+    client_secret: config.CHROME_CLIENT_SECRET,
+    refresh_token: config.CHROME_REFRESH_TOKEN,
+  });
+  const result = await requestJSON(fetchImpl, tokenEndpoint, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
+  }, 'Google OAuth');
+  if (typeof result.access_token !== 'string' || !result.access_token || /[\r\n]/.test(result.access_token)) {
+    throw new Error('Google OAuth 未返回有效的 access token。');
+  }
+  return result.access_token;
+}
+
+/** Only explicit publish calls upload a ZIP; --check performs a read-only status query. */
+export async function runWebstore({ env = process.env, zipPath, checkOnly = false, fetchImpl = fetch, wait = delay, maxPolls = 60 } = {}) {
+  const config = webstoreConfig(env);
+  let zip;
+  if (!checkOnly) {
+    if (!zipPath) throw new Error('请提供插件 ZIP 路径，或使用 --check 只检查连接。');
+    try { zip = await readFile(zipPath); } catch { throw new Error('无法读取插件 ZIP，请先运行 pnpm zip 并检查路径。'); }
+    if (zip.length < 4 || zip.readUInt32LE(0) !== 0x04034b50) throw new Error('指定文件不是有效的插件 ZIP。');
+  }
+  const token = await refreshAccessToken(config, fetchImpl);
+  const resource = `publishers/${encodeURIComponent(config.CHROME_PUBLISHER_ID)}/items/${config.CHROME_EXTENSION_ID}`;
+  const headers = { Authorization: `Bearer ${token}` };
+  const statusURL = `${apiOrigin}/v2/${resource}:fetchStatus`;
+  const status = await requestJSON(fetchImpl, statusURL, { headers }, '查询商店状态');
+  if (checkOnly) return { checked: true, published: status.publishedItemRevisionStatus?.state, submitted: status.submittedItemRevisionStatus?.state };
+
+  // Never cancel or overwrite a submission that the user is already waiting for.
+  const pending = status.submittedItemRevisionStatus?.state;
+  if (pending === 'PENDING_REVIEW' || pending === 'STAGED') throw new Error('当前扩展仍在审核或等待发布，请先在商店控制台处理现有提交。');
+  let upload = await requestJSON(fetchImpl, `${apiOrigin}/upload/v2/${resource}:upload`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/zip' }, body: zip,
+  }, '上传插件');
+  let state = upload.uploadState;
+  for (let attempt = 0; (state === 'IN_PROGRESS' || state === 'UPLOAD_IN_PROGRESS') && attempt < maxPolls; attempt++) {
+    await wait(5_000);
+    upload = await requestJSON(fetchImpl, statusURL, { headers }, '检查上传结果');
+    state = upload.lastAsyncUploadState;
+  }
+  if (state !== 'SUCCEEDED') {
+    if (state === 'IN_PROGRESS' || state === 'UPLOAD_IN_PROGRESS') throw new Error('插件上传仍在处理中，请稍后查看商店控制台；本次没有提交审核。');
+    throw new Error('插件上传未成功，请检查商店控制台中的文件校验结果；本次没有提交审核。');
+  }
+  const result = await requestJSON(fetchImpl, `${apiOrigin}/v2/${resource}:publish`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ publishType: 'DEFAULT_PUBLISH' }),
+  }, '提交商店审核');
+  if (!submissionStates.has(result.state)) throw new Error('商店未返回预期的提交状态，请在控制台核对结果。');
+  return { checked: false, state: result.state };
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes('--help')) {
+    console.log('用法：node scripts/chrome-webstore.mjs <插件.zip>\n      node scripts/chrome-webstore.mjs --check\n需要 CHROME_EXTENSION_ID、CHROME_PUBLISHER_ID 及三个 CHROME_* OAuth 环境变量。');
+    return;
+  }
+  if (args.length !== 1 || (args[0].startsWith('--') && args[0] !== '--check')) throw new Error('参数无效，请使用 --help 查看用法。');
+  const result = await runWebstore({ zipPath: args[0], checkOnly: args[0] === '--check' });
+  if (result.checked) {
+    const published = itemStates.has(result.published) ? result.published : '无已发布版本';
+    const submitted = itemStates.has(result.submitted) ? result.submitted : '无待发布版本';
+    console.log(`Chrome Web Store V2 连接正常。已发布：${published}；提交状态：${submitted}。`);
+  } else console.log(`Chrome Web Store 返回状态：${result.state}。最终发布以商店审核结果为准。`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+}
+````
+
+## scripts/export-source.mjs
+
+````js
+import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+// A reproducible delivery document containing complete source, not excerpts.
+const roots = ['package.json', 'wxt.config.ts', 'tsconfig.json', 'eslint.config.js', 'vitest.config.ts', 'playwright.config.ts', '.gitignore', 'entrypoints', 'components', 'utils', 'types', 'assets', '.github/workflows', 'scripts', 'tests', 'LICENSE'];
+async function files(path) {
+  try {
+    const entries = await readdir(path, { withFileTypes: true });
+    const nested = await Promise.all(entries.sort((a, b) => a.name.localeCompare(b.name)).map((entry) => files(join(path, entry.name))));
+    return nested.flat();
+  } catch (error) { if (error.code === 'ENOTDIR') return [path]; throw error; }
+}
+const list = (await Promise.all(roots.map(files))).flat();
+const fence = '`'.repeat(4);
+const sections = [];
+for (const file of list) {
+  const lang = file.endsWith('.tsx') ? 'tsx' : file.endsWith('.ts') ? 'ts' : file.endsWith('.yml') ? 'yaml' : file.endsWith('.json') ? 'json' : file.endsWith('.mjs') || file.endsWith('.js') ? 'js' : file.endsWith('.css') ? 'css' : file.endsWith('.html') ? 'html' : 'text';
+  sections.push(`## ${file}\n\n${fence}${lang}\n${(await readFile(file, 'utf8')).trimEnd()}\n${fence}`);
+}
+await writeFile('docs/CORE-SOURCE.md', '# LinguaLens 完整核心源码\n\n由 `pnpm docs:source` 从项目文件生成，包含两个 GitHub Actions workflow。锁文件以仓库中的 `pnpm-lock.yaml` 为准。\n\n' + sections.join('\n\n') + '\n');
+console.log(`Exported ${list.length} complete files to docs/CORE-SOURCE.md`);
+````
+
 ## scripts/generate-icons.mjs
 
 ````js
@@ -1947,6 +2103,61 @@ try {
   }
 } finally { await browser.close(); }
 console.log('Generated 16/32/48/128px icons from the LinguaLens vector mark.');
+````
+
+## scripts/store-webstore-credentials.mjs
+
+````js
+import { readFile, stat } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
+
+/** Read gcloud ADC privately, then pass each secret to gh through stdin. */
+export async function storeWebstoreCredentials({ adcPath, repository, run = spawnSync }) {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')) throw new Error('请通过 --repo 指定 owner/repository。');
+  if (!adcPath) throw new Error('请通过 --adc 指定 gcloud 生成的凭据文件。');
+  let info;
+  let credentials;
+  try {
+    info = await stat(adcPath);
+    credentials = JSON.parse(await readFile(adcPath, 'utf8'));
+  } catch { throw new Error('无法读取 ADC 凭据文件，请先完成 gcloud 授权并检查路径。'); }
+  if (!info.isFile()) throw new Error('ADC 路径必须指向普通文件。');
+  if (process.platform !== 'win32' && (info.mode & 0o077)) throw new Error('凭据文件权限过宽，请先执行 chmod 600 限制访问。');
+  if (credentials?.type !== 'authorized_user') throw new Error('需要 gcloud 用户授权生成的 authorized_user 凭据。');
+  const fields = [
+    ['CHROME_CLIENT_ID', 'client_id'],
+    ['CHROME_CLIENT_SECRET', 'client_secret'],
+    ['CHROME_REFRESH_TOKEN', 'refresh_token'],
+  ];
+  if (fields.some(([, key]) => typeof credentials[key] !== 'string' || !credentials[key].trim())) throw new Error('ADC 中缺少 OAuth 客户端信息或 refresh token，请重新授权。');
+  const saved = [];
+  for (const [name, key] of fields) {
+    // Credentials never enter argv, environment variables, stdout or stderr.
+    const result = run('gh', ['secret', 'set', name, '--repo', repository], {
+      input: credentials[key], encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 60_000,
+    });
+    if (result.error || result.status !== 0) throw new Error(`保存 ${name} 失败；已保存 ${saved.length}/3 项。请检查 gh 登录和网络后重试。`);
+    saved.push(name);
+  }
+  return saved;
+}
+
+async function main() {
+  const { values } = parseArgs({ options: { adc: { type: 'string' }, repo: { type: 'string' }, help: { type: 'boolean' } } });
+  if (values.help) {
+    console.log('用法：node scripts/store-webstore-credentials.mjs --adc <ADC文件> --repo <owner/repository>\n从权限为 600 的 gcloud 用户 ADC 文件读取三项 OAuth 凭据，通过 stdin 保存到 GitHub Secrets。');
+    return;
+  }
+  const names = await storeWebstoreCredentials({ adcPath: values.adc, repository: values.repo });
+  console.log(`已保存：${names.join(', ')}。`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+}
 ````
 
 ## tests/api.test.ts
@@ -2711,6 +2922,160 @@ describe('retained translations and bilingual display', () => {
     const h = harness(); h.controller.page('a', 'bilingual'); h.complete(); h.controller.dispose();
     expect(document.body.innerHTML).toBe('<p>Alpha</p>');
     expect(h.controller.status).toMatchObject({ total: 0, cached: 0, viewMode: 'original' });
+  });
+});
+````
+
+## tests/webstore.test.mjs
+
+````js
+// @vitest-environment node
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { refreshAccessToken, runWebstore, webstoreConfig } from '../scripts/chrome-webstore.mjs';
+import { storeWebstoreCredentials } from '../scripts/store-webstore-credentials.mjs';
+
+// All credentials and HTTP responses here are synthetic; no Google calls occur.
+const env = {
+  CHROME_EXTENSION_ID: 'a'.repeat(32), CHROME_PUBLISHER_ID: 'test-publisher',
+  CHROME_CLIENT_ID: 'test.apps.googleusercontent.com', CHROME_CLIENT_SECRET: 'test-client-secret', CHROME_REFRESH_TOKEN: 'test-refresh-token',
+};
+const api = `https://chromewebstore.googleapis.com/v2/publishers/test-publisher/items/${env.CHROME_EXTENSION_ID}`;
+const json = (data, status = 200) => new Response(JSON.stringify(data), { status });
+function server(...responses) {
+  return vi.fn(async () => {
+    const response = responses.shift();
+    if (!response) throw new Error('Unexpected HTTP request');
+    return response;
+  });
+}
+const token = () => json({ access_token: 'test-access-token' });
+let directory;
+let zipPath;
+beforeAll(async () => {
+  directory = await mkdtemp(join(tmpdir(), 'codex-lingualens-webstore-'));
+  zipPath = join(directory, 'test.zip');
+  await writeFile(zipPath, Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+});
+afterAll(async () => { await rm(directory, { recursive: true, force: true }); });
+
+describe('Chrome Web Store V2 publishing', () => {
+  it('rejects missing publisher ID before any request and rejects path injection', async () => {
+    const fetchImpl = vi.fn();
+    await expect(runWebstore({ env: { ...env, CHROME_PUBLISHER_ID: '' }, checkOnly: true, fetchImpl })).rejects.toThrow('CHROME_PUBLISHER_ID');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(() => webstoreConfig({ ...env, CHROME_PUBLISHER_ID: '../elsewhere' })).toThrow('格式无效');
+  });
+
+  it('checks ownership with V2 without uploading, cancelling or publishing', async () => {
+    const fetchImpl = server(token(), json({ submittedItemRevisionStatus: { state: 'PENDING_REVIEW' } }));
+    expect(await runWebstore({ env, checkOnly: true, fetchImpl })).toEqual({ checked: true, published: undefined, submitted: 'PENDING_REVIEW' });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls[1][0]).toBe(`${api}:fetchStatus`);
+    expect(fetchImpl.mock.calls[1][1].headers.Authorization).toBe('Bearer test-access-token');
+    const form = fetchImpl.mock.calls[0][1].body;
+    expect(form.get('client_secret')).toBe(env.CHROME_CLIENT_SECRET);
+    expect(form.get('refresh_token')).toBe(env.CHROME_REFRESH_TOKEN);
+    expect(fetchImpl.mock.calls.every(([, options]) => options.redirect === 'error')).toBe(true);
+  });
+
+  it('uploads the ZIP to V2 and submits for normal review only after success', async () => {
+    const fetchImpl = server(token(), json({}), json({ uploadState: 'SUCCEEDED' }), json({ state: 'PENDING_REVIEW' }));
+    expect(await runWebstore({ env, zipPath, fetchImpl })).toEqual({ checked: false, state: 'PENDING_REVIEW' });
+    expect(fetchImpl.mock.calls[2][0]).toBe(api.replace('/v2/', '/upload/v2/') + ':upload');
+    expect(fetchImpl.mock.calls[2][1].body).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+    expect(fetchImpl.mock.calls[3][0]).toBe(`${api}:publish`);
+    expect(JSON.parse(fetchImpl.mock.calls[3][1].body)).toEqual({ publishType: 'DEFAULT_PUBLISH' });
+  });
+
+  it.each(['IN_PROGRESS', 'UPLOAD_IN_PROGRESS'])('waits for asynchronous upload state %s', async (uploadState) => {
+    const fetchImpl = server(token(), json({}), json({ uploadState }), json({ lastAsyncUploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'SUCCEEDED' }), json({ state: 'PENDING_REVIEW' }));
+    const wait = vi.fn().mockResolvedValue(undefined);
+    await runWebstore({ env, zipPath, fetchImpl, wait });
+    expect(wait).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls.slice(3, 5).map(([url]) => url)).toEqual([`${api}:fetchStatus`, `${api}:fetchStatus`]);
+    expect(fetchImpl.mock.calls[5][0]).toBe(`${api}:publish`);
+  });
+
+  it.each(['PENDING_REVIEW', 'STAGED'])('leaves an existing %s submission alone', async (state) => {
+    const fetchImpl = server(token(), json({ submittedItemRevisionStatus: { state } }));
+    await expect(runWebstore({ env, zipPath, fetchImpl })).rejects.toThrow('处理现有提交');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['FAILED', 'NOT_FOUND', 'UNEXPECTED'])('does not submit after unsuccessful upload %s', async (uploadState) => {
+    const fetchImpl = server(token(), json({}), json({ uploadState }));
+    await expect(runWebstore({ env, zipPath, fetchImpl })).rejects.toThrow('本次没有提交审核');
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it('bounds asynchronous polling and never repeats the upload', async () => {
+    const fetchImpl = server(token(), json({}), json({ uploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'IN_PROGRESS' }), json({ lastAsyncUploadState: 'IN_PROGRESS' }));
+    await expect(runWebstore({ env, zipPath, fetchImpl, wait: vi.fn(), maxPolls: 2 })).rejects.toThrow('仍在处理中');
+    expect(fetchImpl.mock.calls.filter(([url]) => url.endsWith(':upload'))).toHaveLength(1);
+    expect(fetchImpl.mock.calls.some(([url]) => url.endsWith(':publish'))).toBe(false);
+  });
+
+  it('reports revoked refresh tokens without exposing the provider body', async () => {
+    const fetchImpl = server(json({ error: 'invalid_grant', error_description: env.CHROME_REFRESH_TOKEN }, 400));
+    await expect(refreshAccessToken(env, fetchImpl)).rejects.toThrow('重新获取 CHROME_REFRESH_TOKEN');
+    const badClient = server(json({ error: 'invalid_client', error_description: env.CHROME_CLIENT_SECRET }, 400));
+    await expect(refreshAccessToken(env, badClient)).rejects.toThrow('客户端验证失败');
+  });
+
+  it.each([[401, '认证失败'], [403, '权限不足'], [404, '未找到扩展']])('explains HTTP %i without printing sensitive details', async (status, message) => {
+    const fetchImpl = server(token(), json({ error: { message: env.CHROME_CLIENT_SECRET } }, status));
+    await expect(runWebstore({ env, checkOnly: true, fetchImpl })).rejects.toThrow(message);
+  });
+
+  it('does not leak unexpected network or response errors', async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error(env.CHROME_CLIENT_SECRET));
+    await expect(refreshAccessToken(env, fetchImpl)).rejects.toThrow('网络连接失败或超时');
+    const malformed = server(new Response(`not-json-${env.CHROME_REFRESH_TOKEN}`));
+    await expect(refreshAccessToken(env, malformed)).rejects.toThrow('无法解析的响应');
+  });
+});
+
+describe('private ADC import into GitHub Secrets', () => {
+  const adc = { type: 'authorized_user', client_id: env.CHROME_CLIENT_ID, client_secret: env.CHROME_CLIENT_SECRET, refresh_token: env.CHROME_REFRESH_TOKEN };
+  it('sends secrets through stdin without putting them in arguments', async () => {
+    const adcPath = join(directory, 'credentials.json');
+    await writeFile(adcPath, JSON.stringify(adc), { mode: 0o600 });
+    const run = vi.fn().mockReturnValue({ status: 0 });
+    expect(await storeWebstoreCredentials({ adcPath, repository: 'example/lingualens', run })).toEqual(['CHROME_CLIENT_ID', 'CHROME_CLIENT_SECRET', 'CHROME_REFRESH_TOKEN']);
+    for (const [index, value] of [adc.client_id, adc.client_secret, adc.refresh_token].entries()) {
+      const [command, args, options] = run.mock.calls[index];
+      expect(command).toBe('gh');
+      expect(args).not.toContain(value);
+      expect(options.input).toBe(value);
+      expect(options.stdio).toEqual(['pipe', 'pipe', 'pipe']);
+    }
+  });
+
+  it('validates every credential before changing any GitHub secret', async () => {
+    const adcPath = join(directory, 'missing.json');
+    await writeFile(adcPath, JSON.stringify({ ...adc, refresh_token: '' }), { mode: 0o600 });
+    const run = vi.fn();
+    await expect(storeWebstoreCredentials({ adcPath, repository: 'example/lingualens', run })).rejects.toThrow('缺少 OAuth');
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects permissive credential files', async () => {
+    const adcPath = join(directory, 'public.json');
+    await writeFile(adcPath, JSON.stringify(adc), { mode: 0o644 });
+    const run = vi.fn();
+    await expect(storeWebstoreCredentials({ adcPath, repository: 'example/lingualens', run })).rejects.toThrow('chmod 600');
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('stops on a failed save without printing child process stderr or credentials', async () => {
+    const adcPath = join(directory, 'failure.json');
+    await writeFile(adcPath, JSON.stringify(adc), { mode: 0o600 });
+    const run = vi.fn().mockReturnValueOnce({ status: 0 }).mockReturnValue({ status: 1, stderr: adc.refresh_token });
+    await expect(storeWebstoreCredentials({ adcPath, repository: 'example/lingualens', run })).rejects.toThrow('保存 CHROME_CLIENT_SECRET 失败；已保存 1/3 项');
+    expect(run).toHaveBeenCalledTimes(2);
   });
 });
 ````

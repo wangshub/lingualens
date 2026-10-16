@@ -82,7 +82,7 @@ pnpm zip        # 生成安装 ZIP
 npm version patch && git push --follow-tags
 ```
 
-GitHub Actions 自动检查、打包并创建 Release；配置商店凭据后提交 Chrome Web Store 审核。首次上架、OAuth 与 Secrets 配置见 [发布指南](docs/RELEASING.md)。
+GitHub Actions 自动检查、打包并创建 Release；配置商店凭据后通过 V2 API 提交 Chrome Web Store 审核。首次上架、CLI 授权与 Secrets 配置见 [发布指南](docs/RELEASING.md)。
 
 ---
 
