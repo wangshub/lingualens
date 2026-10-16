@@ -2,7 +2,7 @@
 
 ## 1. 项目目录结构
 
-目录树与各模块职责见 [README 项目目录](../README.md#项目目录)。项目采用 `entrypoints`、`components`、`utils`、`types` 分离结构。
+目录树与各模块职责见 [开发指南](DEVELOPMENT.md#项目结构)。项目采用 `entrypoints`、`components`、`utils`、`types` 分离结构。
 
 ## 2. 核心文件完整代码
 
@@ -45,4 +45,4 @@ pnpm zip
 npm version patch && git push --follow-tags
 ```
 
-Chrome Web Store 凭据申请、首次条目创建、开发模式加载与 tag 发布细节见 [README](../README.md)。真实测试结果与未验证的边界见 [verification.md](verification.md)。
+安装步骤见 [README](../README.md#安装)，开发调试见 [开发指南](DEVELOPMENT.md)，Chrome Web Store 凭据与版本发布见 [发布指南](RELEASING.md)。真实测试结果与未验证的边界见 [verification.md](verification.md)。

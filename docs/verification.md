@@ -47,4 +47,4 @@ pnpm test:e2e
 
 没有 Chrome Web Store 开发者条目和四项发布凭据，因此未实际上传或上架商店。README 包含凭据申请、Secrets 配置和首次上传步骤。GitHub 远端 CI 状态以仓库 Actions 为准。
 
-静态扫描只处理当前文档内已渲染文本；不覆盖 Shadow DOM、伪元素、图片文字、Canvas 或浏览器 PDF 阅读器。应用框架重新生成的文本不强行覆盖，详见 README。
+静态扫描只处理当前文档内已渲染文本；不覆盖 Shadow DOM、伪元素、图片文字、Canvas 或浏览器 PDF 阅读器。应用框架重新生成的文本不强行覆盖，详见 [配置指南](CONFIGURATION.md)。
