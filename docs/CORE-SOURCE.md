@@ -7,7 +7,7 @@
 ````json
 {
   "name": "lingualens",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "BYOK Chrome 翻译插件",
   "type": "module",
@@ -1593,6 +1593,8 @@ jobs:
         with:
           name: chrome-release-zip
           path: .output/*-chrome.zip
+          # WXT places the ZIP inside a hidden directory.
+          include-hidden-files: true
           if-no-files-found: error
       - name: Create GitHub Release with automatic changelog
         env:

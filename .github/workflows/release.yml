@@ -41,6 +41,8 @@ jobs:
         with:
           name: chrome-release-zip
           path: .output/*-chrome.zip
+          # WXT places the ZIP inside a hidden directory.
+          include-hidden-files: true
           if-no-files-found: error
       - name: Create GitHub Release with automatic changelog
         env:
