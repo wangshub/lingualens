@@ -16,7 +16,8 @@ LinguaLens-Chrome-Extension/
 │   ├── api.ts                     # SSE、超时与 API 错误
 │   ├── background-translation.ts  # 分批、调度与退避重试
 │   ├── content-transport.ts        # Port 流式事件和保活
-│   ├── translation-controller.ts  # 节点快照、段落回滚、恢复
+│   ├── translation-controller.ts  # 原译文缓存、显示切换、段落回滚
+│   ├── bilingual.ts               # 段落双语渲染、源节点校验
 │   ├── dom.ts                     # TreeWalker、过滤、Unicode 切片
 │   ├── protocol.ts                # JSONL 增量解码与完整性校验
 │   ├── page-toolbar.ts            # ShadowRoot 状态与单段重试

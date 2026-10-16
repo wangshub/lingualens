@@ -11,6 +11,7 @@ let origin: string;
 let extensionId: string;
 let userDataDir: string;
 let failedOnce = false;
+let translationRequests = 0;
 const fixture = `<!doctype html><html lang="en"><head><meta charset="UTF-8"><title>LinguaLens test article</title><style>body{max-width:720px;margin:70px auto;font:18px/1.8 system-ui;color:#182230}h1{font-size:34px}pre{background:#f1f5f9;padding:20px}a{color:#2563eb}button{padding:10px}</style></head><body><h1>Read beyond borders.</h1><p id="first">Hello <strong>world</strong>. Read <a href="#more">more stories</a> today.</p><p id="second">Translation keeps the original meaning and the number 2026.</p><p id="failure">FAIL paragraph for a single retry.</p><p id="more">Keep your links, emphasis, and page interactions.</p><pre><code>const original = "DO NOT TRANSLATE";</code></pre><div hidden>Hidden content stays unchanged.</div><div contenteditable="true">Editable draft stays unchanged.</div><button id="counter">Click counter</button></body></html>`;
 
 test.beforeAll(async () => {
@@ -19,6 +20,7 @@ test.beforeAll(async () => {
     const parts: Buffer[] = [];
     for await (const part of req) parts.push(Buffer.from(part));
     const body = JSON.parse(Buffer.concat(parts).toString()) as { messages: { content: string }[] };
+    if (body.messages.at(-1)?.content !== 'Reply OK.') translationRequests++;
     if (req.url?.startsWith('/unauthorized') || req.headers.authorization !== 'Bearer fixture-key') { res.writeHead(401); res.end('{}'); return; }
     const user = body.messages.at(-1)!.content;
     if (req.url?.startsWith('/fail-once') && user.includes('FAIL') && !failedOnce) { failedOnce = true; res.writeHead(400); res.end('{}'); return; }
@@ -65,6 +67,7 @@ async function configure(path = '/v1') {
   await page.getByLabel('API Base URL', { exact: true }).fill(origin + path);
   await page.getByLabel('API Key', { exact: true }).fill('fixture-key');
   await page.getByLabel('模型名称', { exact: true }).fill('fixture-translator');
+  await page.getByLabel('目标语言', { exact: true }).fill('简体中文');
   await page.getByRole('button', { name: '保存配置', exact: true }).click();
   await expect(page.getByRole('status').filter({ hasText: '配置已保存' })).toBeVisible();
   return page;
@@ -201,4 +204,104 @@ test('selection context snapshot, restoration cancellation and real popup action
   await popup.getByRole('button', { name: /还原原文/ }).click();
   await expect(page.locator('#first')).toHaveText('Hello world. Read more stories today.');
   await popup.close(); await page.close();
+});
+
+test('cached original/translated/bilingual switches make no API requests', async () => {
+  const options = await configure(); await options.close();
+  const page = await context.newPage(); await page.goto(origin + '/cached-switches');
+  await page.evaluate(() => { Object.assign(window, { originalLink: document.querySelector('#first a') }); });
+  await command(page.url(), { type: 'page' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  const requestsAfterTranslation = translationRequests;
+  await command(page.url(), { type: 'restore' });
+  await expect(page.locator('#first')).toHaveText('Hello world. Read more stories today.');
+  const popup = await context.newPage(); await popup.goto(`chrome-extension://${extensionId}/popup.html`); await page.bringToFront();
+  await expect(popup.getByRole('button', { name: '还原原文', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  for (let i = 0; i < 2; i++) {
+    await popup.getByRole('button', { name: '双语对照', exact: true }).click();
+    await expect(page.locator('#first [data-lingualens-translation] section')).toContainText('译：Hello');
+    expect(await page.locator('#first').evaluate((p) => p.textContent)).toBe('Hello world. Read more stories today.');
+    await expect(page.locator('#first [data-lingualens-translation] strong')).toHaveText('译：world');
+    await expect(page.locator('[data-lingualens-translation]')).toHaveCount(5);
+    await page.locator('#first').evaluate((p) => {
+      const host = p.querySelector('[data-lingualens-translation]')!;
+      const range = document.createRange(); range.setStart(p, 0); range.setEndBefore(host);
+      if (host.getBoundingClientRect().top < range.getBoundingClientRect().bottom) throw new Error('Translation is not below its original paragraph');
+    });
+    if (i === 0) {
+      await popup.locator('main').screenshot({ path: 'artifacts/screenshots/popup-bilingual.png', animations: 'disabled' });
+      await page.screenshot({ path: 'artifacts/screenshots/page-bilingual.png', fullPage: true, animations: 'disabled' });
+    }
+    await popup.getByRole('button', { name: '还原原文', exact: true }).click();
+    await expect(page.locator('[data-lingualens-translation]')).toHaveCount(0);
+    await popup.getByRole('button', { name: '译文', exact: true }).click();
+    await expect(page.locator('#first')).toContainText('译：Hello');
+    expect(translationRequests).toBe(requestsAfterTranslation);
+  }
+  expect(await page.evaluate(() => document.querySelector('#first a') === (window as typeof window & { originalLink: Element }).originalLink)).toBe(true);
+  await popup.getByRole('button', { name: '重新翻译', exact: true }).click();
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  expect(translationRequests).toBeGreaterThan(requestsAfterTranslation);
+  await popup.close(); await page.close();
+});
+
+test('bilingual mode starts with original text and rolls back a failed paragraph', async () => {
+  failedOnce = false;
+  const options = await configure('/fail-once/v1'); await options.close();
+  const page = await context.newPage(); await page.goto(origin + '/bilingual-first');
+  await command(page.url(), { type: 'page', mode: 'bilingual' });
+  await expect(page.locator('#first [data-lingualens-translation] section')).toContainText('译：Hello');
+  expect(await page.locator('#first').evaluate((p) => p.textContent)).toBe('Hello world. Read more stories today.');
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  await expect(page.locator('#failure [data-lingualens-translation]')).toHaveCount(0);
+  await expect(page.locator('#failure')).toHaveText('FAIL paragraph for a single retry.');
+  await command(page.url(), { type: 'retry', groupId: 'g3' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  await expect(page.locator('#failure [data-lingualens-translation] section')).toContainText('译：FAIL');
+  const requestsAfterTranslation = translationRequests;
+  await command(page.url(), { type: 'restore' }); await command(page.url(), { type: 'page', mode: 'bilingual' });
+  expect(translationRequests).toBe(requestsAfterTranslation);
+  await expect(page.locator('[data-lingualens-translation]')).toHaveCount(5);
+  await page.close();
+});
+
+test('language/model/prompt changes expire cache without sending a translation request', async () => {
+  const options = await configure();
+  const page = await context.newPage(); await page.goto(origin + '/context-expiry');
+  await command(page.url(), { type: 'page' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  const changes: [string, string][] = [['目标语言', 'English'], ['模型名称', 'fixture-translator-v2'], ['系统 Prompt', '请忠实翻译为{目标语言}，只输出译文。']];
+  for (const [field, value] of changes) {
+    const before = translationRequests;
+    await options.getByLabel(field, { exact: true }).fill(value);
+    await options.getByRole('button', { name: '保存配置', exact: true }).click();
+    await expect(options.getByText('配置已保存。', { exact: true })).toBeVisible();
+    const state = await command(page.url(), { type: 'status' }) as { cached: number };
+    expect(state.cached).toBe(0);
+    await expect(page.locator('#first')).toHaveText('Hello world. Read more stories today.');
+    await command(page.url(), { type: 'view', mode: 'translated' }); expect(translationRequests).toBe(before);
+    await command(page.url(), { type: 'page' });
+    await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+    expect(translationRequests).toBeGreaterThan(before);
+  }
+  await options.close(); await page.close();
+});
+
+test('a source edit invalidates one cached paragraph and preserves the others', async () => {
+  const options = await configure(); await options.close();
+  const page = await context.newPage(); await page.goto(origin + '/edited-source');
+  await command(page.url(), { type: 'page' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  const before = translationRequests;
+  await command(page.url(), { type: 'restore' });
+  await page.locator('#first').evaluate((p) => { p.firstChild!.textContent = 'Changed text '; });
+  await command(page.url(), { type: 'view', mode: 'translated' });
+  await expect(page.locator('#first')).toContainText('Changed text'); expect(translationRequests).toBe(before);
+  await command(page.url(), { type: 'page' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  expect(translationRequests).toBe(before + 1);
+  await expect(page.locator('#first')).toContainText('译：Changed text');
+  await command(page.url(), { type: 'restore' });
+  await expect(page.locator('#first')).toHaveText('Changed text world. Read more stories today.');
+  await page.close();
 });

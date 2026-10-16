@@ -21,7 +21,11 @@ export interface PublicSettings {
   profileName: string;
   model: string;
   targetLanguage: string;
+  cacheKey: string;
 }
+
+export type ViewMode = 'original' | 'translated' | 'bilingual';
+export type TranslationMode = Exclude<ViewMode, 'original'>;
 
 /** Each source segment belongs to a paragraph, but never contains HTML. */
 export interface Segment {
@@ -31,7 +35,7 @@ export interface Segment {
 }
 
 export type StreamRequest =
-  | { type: 'translate'; segments: Segment[] }
+  | { type: 'translate'; segments: Segment[]; cacheKey?: string }
   | { type: 'ping' }
   | { type: 'cancel' };
 
@@ -45,9 +49,10 @@ export type StreamEvent =
   | { type: 'pong' };
 
 export type PageCommand =
-  | { type: 'page' }
+  | { type: 'page'; mode?: TranslationMode; force?: boolean }
   | { type: 'selection'; selectionText: string }
   | { type: 'restore' }
+  | { type: 'view'; mode: ViewMode }
   | { type: 'retry'; groupId?: string }
   | { type: 'status' }
   | { type: 'ping' }
@@ -58,6 +63,8 @@ export interface PageStatus {
   total: number;
   completed: number;
   failed: number;
+  viewMode: ViewMode;
+  cached: number;
   restored?: number;
   message?: string;
 }

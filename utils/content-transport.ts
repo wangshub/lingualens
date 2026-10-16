@@ -1,11 +1,11 @@
 import type { Segment, StreamEvent } from '../types';
 
-export type TranslationTransport = (segments: Segment[], receive: (event: StreamEvent) => void) => () => void;
+export type TranslationTransport = (segments: Segment[], receive: (event: StreamEvent) => void, cacheKey?: string) => () => void;
 
 /** Real traffic on the Port every 15 s keeps an MV3 worker alive during slow
  * model responses. Disconnect/navigation cancels fetches in the worker.
  */
-export const connectTranslation: TranslationTransport = (segments, receive) => {
+export const connectTranslation: TranslationTransport = (segments, receive, cacheKey) => {
   const port = chrome.runtime.connect({ name: 'lingualens.translation.v1' });
   let closed = false;
   const heartbeat = setInterval(() => {
@@ -21,6 +21,6 @@ export const connectTranslation: TranslationTransport = (segments, receive) => {
     const runtimeError = chrome.runtime.lastError;
     if (!closed) { closed = true; clearInterval(heartbeat); receive({ type: 'fatal', error: runtimeError ? '插件连接已中断，请刷新页面后重试。' : '翻译后台已断开，请重试。' }); }
   });
-  port.postMessage({ type: 'translate', segments });
+  port.postMessage({ type: 'translate', segments, cacheKey });
   return close;
 };

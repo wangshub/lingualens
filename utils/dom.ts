@@ -1,5 +1,6 @@
-/** Translation changes Text.data only. No replaceWith/innerHTML/normalize call is
- * allowed here: existing elements, links, listeners, and node identities survive.
+/** In-place translation changes Text.data only. Bilingual output uses a separate
+ * owned companion. Never replace or normalize the source elements/text nodes:
+ * existing links, listeners and node identities must survive every view change.
  */
 export const EXCLUDED = 'script,style,noscript,code,pre,kbd,samp,textarea,input,select,option,button,svg,math,canvas,iframe,object,embed,[contenteditable]:not([contenteditable="false"]),[translate="no"],.notranslate,[aria-hidden="true"],[data-lingualens-ui]';
 export const PENDING_CLASS = 'lingualens-node-pending';
@@ -26,7 +27,8 @@ export function collectText(root: Node = document.body, ranges?: Range[]): TextS
     // Rendered content below the viewport is included; display:none and closed
     // details are excluded. This does not limit translation to the viewport.
     if (!rectRange.getClientRects().length) return;
-    let block = parent;
+    // Prefer semantic paragraphs over a styled inline descendant.
+    let block = parent.closest('p,h1,h2,h3,h4,h5,h6,li,dt,dd,td,th,figcaption,blockquote') ?? parent;
     while (block.parentElement && !/^(block|flow-root|list-item|table-cell|flex|grid)$/.test(getComputedStyle(block).display)) block = block.parentElement;
     const add = (start: number, end: number) => {
       const value = node.data.slice(start, end);

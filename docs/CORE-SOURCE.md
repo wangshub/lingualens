@@ -7,7 +7,7 @@
 ````json
 {
   "name": "lingualens",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "description": "BYOK Chrome 翻译插件",
   "type": "module",
@@ -172,7 +172,7 @@ artifacts/
 ````ts
 import { defineBackground } from 'wxt/utils/define-background';
 import type { ModelProfile, PageCommand, Reply, StreamEvent, StreamRequest } from '../types';
-import { activeProfile, loadSettings, saveSettings, validateProfile } from '../utils/settings';
+import { activeProfile, loadSettings, saveSettings, translationContext, validateProfile } from '../utils/settings';
 import { ApiError, errorMessage, streamChat } from '../utils/api';
 import { translateSegments } from '../utils/background-translation';
 
@@ -187,6 +187,8 @@ export default defineBackground(() => {
     await chrome.contextMenus.removeAll();
     chrome.contextMenus.create({ id: 'selection', title: '翻译选中内容', contexts: ['selection'] });
     chrome.contextMenus.create({ id: 'page', title: '翻译整个页面', contexts: ['page'] });
+    chrome.contextMenus.create({ id: 'bilingual', title: '双语对照整个页面', contexts: ['page'] });
+    chrome.contextMenus.create({ id: 'show-translated', title: '显示缓存译文', contexts: ['all'] });
     chrome.contextMenus.create({ id: 'restore', title: '还原原文', contexts: ['all'] });
     chrome.contextMenus.create({ id: 'retry', title: '重试失败段落', contexts: ['all'] });
   };
@@ -200,7 +202,7 @@ export default defineBackground(() => {
       try { await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ['content-scripts/content.js'] }); }
       catch { throw new Error('当前页面不允许注入插件。请打开普通网页；安装或更新插件后也可刷新页面再试。'); }
     }
-    const response = command.type === 'restore'
+    const response = command.type === 'restore' || (command.type === 'view' && command.mode === 'original')
       ? await chrome.tabs.sendMessage(tabId, command)
       : await chrome.tabs.sendMessage(tabId, command, { frameId });
     if (response && typeof response === 'object' && 'error' in response) throw new Error(String(response.error));
@@ -214,6 +216,8 @@ export default defineBackground(() => {
     const command: PageCommand = info.menuItemId === 'selection'
       ? { type: 'selection', selectionText: info.selectionText ?? '' }
       : info.menuItemId === 'restore' ? { type: 'restore' }
+      : info.menuItemId === 'bilingual' ? { type: 'page', mode: 'bilingual' }
+      : info.menuItemId === 'show-translated' ? { type: 'view', mode: 'translated' }
       : info.menuItemId === 'retry' ? { type: 'retry' } : { type: 'page' };
     void dispatch(tab.id, command, info.frameId ?? 0).catch(async (error: unknown) => {
       // The page toast is preferred; the action badge still works on blocked pages.
@@ -232,7 +236,7 @@ export default defineBackground(() => {
       await storageReady;
       if (msg.type === 'public-settings') {
         const p = activeProfile(await loadSettings());
-        return { profileName: p.name, model: p.model, targetLanguage: p.targetLanguage };
+        return { profileName: p.name, model: p.model, targetLanguage: p.targetLanguage, cacheKey: await translationContext(p) };
       }
       if (msg.type === 'dispatch' && trusted && typeof msg.tabId === 'number' && msg.command && typeof msg.command === 'object') {
         return dispatch(msg.tabId, msg.command as PageCommand);
@@ -263,7 +267,7 @@ export default defineBackground(() => {
       if (message.type === 'cancel') { controller.abort(); return; }
       if (message.type !== 'translate' || started) return;
       started = true;
-      void storageReady.then(() => translateSegments(message.segments, controller.signal, send)).catch((error: unknown) => send({ type: 'fatal', error: errorMessage(error) }));
+      void storageReady.then(() => translateSegments(message.segments, controller.signal, send, message.cacheKey)).catch((error: unknown) => send({ type: 'fatal', error: errorMessage(error) }));
     });
   });
 });
@@ -273,10 +277,11 @@ export default defineBackground(() => {
 
 ````ts
 import { defineContentScript } from 'wxt/utils/define-content-script';
-import type { PageCommand } from '../types';
+import type { PageCommand, PublicSettings, ViewMode } from '../types';
 import { connectTranslation } from '../utils/content-transport';
 import { TranslationController } from '../utils/translation-controller';
 import { createPageToolbar } from '../utils/page-toolbar';
+import { request } from '../utils/messaging';
 
 export default defineContentScript({
   matches: ['http://*/*', 'https://*/*'],
@@ -288,7 +293,12 @@ export default defineContentScript({
     if (global.__lingualensInstalled) return;
     global.__lingualensInstalled = true;
     const controller = new TranslationController(connectTranslation, () => toolbar.update());
-    const toolbar = createPageToolbar(controller);
+    const context = () => request<PublicSettings>({ type: 'public-settings' });
+    const changeView = async (mode: ViewMode) => {
+      if (mode === 'original') controller.restore();
+      else controller.show(mode, (await context()).cacheKey);
+    };
+    const toolbar = createPageToolbar(controller, changeView);
     const style = document.createElement('style');
     style.textContent = '.lingualens-node-pending{opacity:.65!important;transition:opacity .15s!important}.lingualens-node-failed{outline:1px dashed #d97706!important;outline-offset:3px!important}@media(prefers-reduced-motion:reduce){.lingualens-node-pending{transition:none!important}}';
     document.documentElement.append(style);
@@ -299,9 +309,12 @@ export default defineContentScript({
     }, { capture: true });
     const listener = (command: PageCommand, sender: chrome.runtime.MessageSender, respond: (value: unknown) => void) => {
       if (sender.id !== chrome.runtime.id) return;
-      try {
-        if (command.type === 'ping') { respond({ alive: true }); return; }
-        if (command.type === 'page') controller.page();
+      const handle = async () => {
+        if (command.type === 'ping') return { alive: true };
+        if (command.type === 'restore') { controller.restore(); return controller.status; }
+        if (command.type === 'view') { await changeView(command.mode); return controller.status; }
+        const settings = await context();
+        if (command.type === 'page') controller.page(settings.cacheKey, command.mode, command.force);
         if (command.type === 'selection') {
           const selection = window.getSelection();
           const live = selection ? Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange()) : [];
@@ -309,20 +322,22 @@ export default defineContentScript({
           const matches = (ranges: Range[]) => ranges.length > 0 && normalize(ranges.map((r) => r.toString()).join(' ')) === normalize(command.selectionText);
           const ranges = matches(savedRanges) ? savedRanges : matches(live) ? live : [];
           if (!ranges.length || ranges.every((r) => r.collapsed)) throw new Error('选区已失效，请重新选中文本后翻译。');
-          controller.selection(ranges); selection?.removeAllRanges(); savedRanges = [];
+          controller.selection(ranges, settings.cacheKey); selection?.removeAllRanges(); savedRanges = [];
         }
-        if (command.type === 'restore') controller.restore();
+        if (command.type === 'status' || command.type === 'retry') controller.refreshContext(settings.cacheKey);
         if (command.type === 'retry') controller.retry(command.groupId);
         if (command.type === 'notice') toolbar.notice(command.error);
-        respond(controller.status);
-      } catch (error) {
+        return controller.status;
+      };
+      void handle().then(respond).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : '操作失败，请重试。';
         toolbar.notice(message); respond({ ...controller.status, message, error: message });
-      }
+      });
+      return true;
     };
     chrome.runtime.onMessage.addListener(listener);
     ctx.onInvalidated(() => {
-      controller.restore(false); toolbar.remove(); style.remove();
+      controller.dispose(); toolbar.remove(); style.remove();
       chrome.runtime.onMessage.removeListener(listener); global.__lingualensInstalled = false;
     });
   },
@@ -453,7 +468,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><
 ````tsx
 import { useCallback, useEffect, useState } from 'react';
 import { ArrowRight, Languages, LoaderCircle, RotateCcw, Settings2 } from 'lucide-react';
-import type { PageCommand, PageStatus, Settings } from '../../types';
+import type { PageCommand, PageStatus, Settings, ViewMode } from '../../types';
 import { Brand } from '../../components/Brand';
 import { Feedback, type FeedbackValue } from '../../components/Feedback';
 import { useSettings } from '../../components/useSettings';
@@ -486,15 +501,18 @@ export function Popup() {
     finally { setPending(false); }
   };
   const busy = pending || status?.busy;
+  const complete = !!status?.cached && status.completed === status.total;
   const languages = LANGUAGES.includes(profile.targetLanguage) ? LANGUAGES : [profile.targetLanguage, ...LANGUAGES];
 
   return <main className="entrance w-[380px] bg-white p-5">
     <header className="mb-7 flex items-center justify-between"><Brand compact /><button className="icon-btn" title="打开设置" aria-label="打开设置" onClick={() => { void chrome.runtime.openOptionsPage(); }}><Settings2 size={19} /></button></header>
     <div className="mb-5"><label htmlFor="profile" className="field-label flex items-center justify-between">当前模型<span className="text-xs font-normal tracking-wide text-slate-400">BYOK</span></label><select id="profile" className="field" value={profile.id} disabled={busy} onChange={(e) => { void persist({ ...settings, activeProfileId: e.target.value }); }}>{settings.profiles.map((p) => <option key={p.id} value={p.id}>{p.name} · {p.model}</option>)}</select></div>
     <div className="mb-6"><label className="field-label" htmlFor="language">翻译为</label><div className="flex items-center gap-3"><div className="flex size-11 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-600"><Languages size={20} /></div><select className="field" id="language" value={profile.targetLanguage} disabled={busy} onChange={(e) => { void persist({ ...settings, profiles: settings.profiles.map((p) => p.id === profile.id ? { ...p, targetLanguage: e.target.value } : p) }); }}>{languages.map((l) => <option key={l}>{l}</option>)}</select></div></div>
-    <button className="btn btn-primary w-full py-3" disabled={busy} onClick={() => { void action({ type: 'page' }); }}>{busy ? <><LoaderCircle size={18} className="animate-spin" />正在翻译…</> : <>翻译当前页面<ArrowRight size={17} /></>}</button>
-    <button className="btn mt-2.5 w-full" disabled={pending} onClick={() => { void action({ type: 'restore' }); }}><RotateCcw size={16} />还原原文{status?.busy ? '并停止' : ''}</button>
-    {(status?.total ?? 0) > 0 && <div className="mt-4"><div className="mb-2 flex justify-between text-sm text-slate-500"><span>{status?.message}</span><span>{status?.completed}/{status?.total} 段</span></div><div className="h-1 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-blue-600 transition-[width]" style={{ width: `${((status?.completed ?? 0) + (status?.failed ?? 0)) / (status?.total ?? 1) * 100}%` }} /></div>{!!status?.failed && <button className="mt-3 text-sm text-amber-700 underline underline-offset-4" disabled={busy} onClick={() => { void action({ type: 'retry' }); }}>重试 {status.failed} 个失败段落</button>}</div>}
+    <button className="btn btn-primary w-full py-3" disabled={busy} onClick={() => { void action({ type: 'page', force: complete }); }}>{busy ? <><LoaderCircle size={18} className="animate-spin" />正在翻译…</> : complete ? <>重新翻译<RotateCcw size={17} /></> : <>翻译当前页面<ArrowRight size={17} /></>}</button>
+    <div role="group" aria-label="显示方式" className="mt-3 grid grid-cols-3 gap-1.5 rounded-lg bg-slate-100 p-1">
+      {([['original', '原文'], ['translated', '译文'], ['bilingual', '双语对照']] as [ViewMode, string][]).map(([mode, label]) => <button key={mode} type="button" aria-label={mode === 'original' ? '还原原文' : label} aria-pressed={(status?.viewMode ?? 'original') === mode} disabled={pending} onClick={() => { void action({ type: 'view', mode }); }} className={`min-h-10 rounded-md px-2 py-2 text-sm font-medium transition-colors disabled:opacity-50 ${(status?.viewMode ?? 'original') === mode ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:bg-white/70 hover:text-slate-800'}`}>{label}</button>)}
+    </div>
+    {(status?.total ?? 0) > 0 && <div className="mt-4"><div className="mb-2 flex justify-between gap-2 text-sm text-slate-500"><span className="min-w-0">{status?.message}</span><span className="shrink-0">{status?.completed}/{status?.total} 段</span></div>{status?.busy && <div className="h-1 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-blue-600 transition-[width]" style={{ width: `${((status?.completed ?? 0) + (status?.failed ?? 0)) / (status?.total ?? 1) * 100}%` }} /></div>}{!!status?.failed && <button className="mt-3 text-sm text-amber-700 underline underline-offset-4" disabled={busy} onClick={() => { void action({ type: 'retry' }); }}>重试 {status.failed} 个失败段落</button>}</div>}
     {feedback && <div className="mt-4"><Feedback value={feedback} /></div>}
     <footer className="mt-6 border-t border-slate-100 pt-4 text-center text-sm text-slate-500">选中文本后右键，直接翻译选区。</footer>
   </main>;
@@ -724,7 +742,7 @@ export async function abortableDelay(ms: number, signal: AbortSignal): Promise<v
 ````ts
 import type { Segment, StreamEvent } from '../types';
 import { ApiError, abortableDelay, errorMessage, streamChat } from './api';
-import { activeProfile, loadSettings, renderPrompt, validateProfile } from './settings';
+import { activeProfile, loadSettings, renderPrompt, translationContext, validateProfile } from './settings';
 import { batchSegments, encodeSegments, TRANSPORT_PROMPT, TranslationDecoder } from './protocol';
 import { Semaphore } from './scheduler';
 
@@ -747,11 +765,12 @@ export function validateSegments(value: unknown): asserts value is Segment[] {
 /** Each batch is validated before a complete event is emitted. Failed paragraphs
  * are rolled back by the content controller, including their earlier batches.
  */
-export async function translateSegments(segments: Segment[], signal: AbortSignal, send: (event: StreamEvent) => void): Promise<void> {
+export async function translateSegments(segments: Segment[], signal: AbortSignal, send: (event: StreamEvent) => void, cacheKey?: string): Promise<void> {
   validateSegments(segments);
   const settings = await loadSettings();
   const profile = activeProfile(settings);
   validateProfile(profile);
+  if (cacheKey && cacheKey !== await translationContext(profile)) throw new Error('模型配置已更新，请重新开始翻译。');
   const batches = batchSegments(segments, settings.batchBytes);
   const failedGroups = new Set<string>();
   let fatalError: unknown;
@@ -801,17 +820,109 @@ export async function translateSegments(segments: Segment[], signal: AbortSignal
 }
 ````
 
+## utils/bilingual.ts
+
+````ts
+import { EXCLUDED } from './dom';
+
+/** Detect replaced, moved or inserted source nodes without counting extension UI. */
+export function sourceStructure(root: Element): { node: Text; parent: Node | null; source: string }[] {
+  const result: { node: Text; parent: Node | null; source: string }[] = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    if (!node.parentElement?.closest(EXCLUDED)) result.push({ node, parent: node.parentNode, source: node.data });
+  }
+  return result;
+}
+
+interface TranslationRow { host: HTMLSpanElement; text: Map<Text, Text> }
+const INLINE = new Set(['A', 'SPAN', 'STRONG', 'B', 'EM', 'I', 'U', 'S', 'SMALL', 'MARK', 'SUB', 'SUP', 'BR', 'ABBR', 'BDI', 'BDO', 'Q', 'CITE', 'TIME', 'DEL', 'INS', 'WBR', 'CODE', 'KBD', 'SAMP']);
+const OMIT = 'script,style,noscript,input,textarea,select,button,svg,math,canvas,iframe,object,embed,[contenteditable]:not([contenteditable="false"]),[hidden],[aria-hidden="true"],[data-lingualens-ui]';
+
+/** A block-level span is legal inside p/li/td and participates in their flow.
+ * Its ShadowRoot isolates styling and avoids copying IDs, event handlers or
+ * executable HTML. Source elements are never cloned/replaced/reparented.
+ */
+export class BilingualRenderer {
+  private rows = new Map<Element, TranslationRow>();
+
+  update(element: Element, id: string, owned: Set<Text>, value: (node: Text) => string): void {
+    let row = this.rows.get(element);
+    if (!row?.host.isConnected) {
+      row?.host.remove();
+      const host = document.createElement('span');
+      host.dataset.lingualensUi = 'translation';
+      host.dataset.lingualensTranslation = id;
+      host.style.cssText = 'all:initial!important;display:block!important;font:inherit!important;color:inherit!important;margin:.55em 0 .15em!important;white-space:normal!important;';
+      const shadow = host.attachShadow({ mode: 'open' });
+      const style = document.createElement('style');
+      style.textContent = 'section{font:inherit;font-weight:400;line-height:1.65;border-inline-start:2px solid #93c5fd;padding-inline-start:.75em;overflow-wrap:anywhere;white-space:pre-wrap}a{color:#2563eb;text-decoration:underline}strong,b{font-weight:700}code,kbd,samp{font-family:monospace;font-size:.92em}';
+      const section = document.createElement('section');
+      section.setAttribute('aria-label', '段落译文'); section.dir = 'auto';
+      const text = new Map<Text, Text>();
+      const clone = (source: Node): Node | null => {
+        if (source.nodeType === Node.TEXT_NODE) {
+          const copy = document.createTextNode(value(source as Text)); text.set(source as Text, copy); return copy;
+        }
+        if (!(source instanceof HTMLElement) || source.matches(OMIT)) return null;
+        // A layout container may also own nested, independently translated
+        // paragraphs. Include only this paragraph's own inline content.
+        const containsOwned = [...owned].some((node) => source.contains(node));
+        if (!INLINE.has(source.tagName) && !containsOwned) return null;
+        const copy = document.createElement(INLINE.has(source.tagName) ? source.tagName.toLowerCase() : 'span');
+        for (const attribute of ['title', 'lang', 'dir']) if (source.hasAttribute(attribute)) copy.setAttribute(attribute, source.getAttribute(attribute)!);
+        if (source.tagName === 'A' && source.hasAttribute('href')) {
+          const href = source.getAttribute('href')!;
+          try {
+            const url = new URL(href, document.baseURI);
+            if (['http:', 'https:', 'mailto:', 'tel:'].includes(url.protocol)) {
+              copy.setAttribute('href', url.href); copy.setAttribute('target', '_blank'); copy.setAttribute('rel', 'noopener noreferrer');
+            }
+          } catch { /* Invalid source links remain readable text. */ }
+        }
+        for (const child of source.childNodes) { const next = clone(child); if (next) copy.appendChild(next); }
+        return copy;
+      };
+      for (const source of element.childNodes) { const copy = clone(source); if (copy) section.append(copy); }
+      shadow.append(style, section);
+      // Put the translation before nested lists/paragraphs when the source is
+      // a list item, table cell or a layout container with direct text.
+      let anchor: Node | undefined;
+      for (const node of owned) {
+        let child: Node = node;
+        while (child.parentNode && child.parentNode !== element) child = child.parentNode;
+        if (child.parentNode === element) anchor = child;
+      }
+      // Punctuation-only text nodes are not translation units, but still belong
+      // above the bilingual row. Stop before an independent nested block.
+      while (anchor?.nextSibling) {
+        const next = anchor.nextSibling;
+        if (next instanceof HTMLElement && !INLINE.has(next.tagName) && /^(block|flow-root|list-item|table|flex|grid)$/.test(getComputedStyle(next).display)) break;
+        anchor = next;
+      }
+      if (anchor) element.insertBefore(host, anchor.nextSibling); else element.append(host);
+      row = { host, text }; this.rows.set(element, row);
+    }
+    for (const [source, copy] of row.text) copy.data = value(source);
+  }
+
+  remove(element: Element): void { this.rows.get(element)?.host.remove(); this.rows.delete(element); }
+  clear(): void { for (const element of this.rows.keys()) this.remove(element); }
+}
+````
+
 ## utils/content-transport.ts
 
 ````ts
 import type { Segment, StreamEvent } from '../types';
 
-export type TranslationTransport = (segments: Segment[], receive: (event: StreamEvent) => void) => () => void;
+export type TranslationTransport = (segments: Segment[], receive: (event: StreamEvent) => void, cacheKey?: string) => () => void;
 
 /** Real traffic on the Port every 15 s keeps an MV3 worker alive during slow
  * model responses. Disconnect/navigation cancels fetches in the worker.
  */
-export const connectTranslation: TranslationTransport = (segments, receive) => {
+export const connectTranslation: TranslationTransport = (segments, receive, cacheKey) => {
   const port = chrome.runtime.connect({ name: 'lingualens.translation.v1' });
   let closed = false;
   const heartbeat = setInterval(() => {
@@ -827,7 +938,7 @@ export const connectTranslation: TranslationTransport = (segments, receive) => {
     const runtimeError = chrome.runtime.lastError;
     if (!closed) { closed = true; clearInterval(heartbeat); receive({ type: 'fatal', error: runtimeError ? '插件连接已中断，请刷新页面后重试。' : '翻译后台已断开，请重试。' }); }
   });
-  port.postMessage({ type: 'translate', segments });
+  port.postMessage({ type: 'translate', segments, cacheKey });
   return close;
 };
 ````
@@ -865,8 +976,9 @@ export function defaultSettings(): Settings {
 ## utils/dom.ts
 
 ````ts
-/** Translation changes Text.data only. No replaceWith/innerHTML/normalize call is
- * allowed here: existing elements, links, listeners, and node identities survive.
+/** In-place translation changes Text.data only. Bilingual output uses a separate
+ * owned companion. Never replace or normalize the source elements/text nodes:
+ * existing links, listeners and node identities must survive every view change.
  */
 export const EXCLUDED = 'script,style,noscript,code,pre,kbd,samp,textarea,input,select,option,button,svg,math,canvas,iframe,object,embed,[contenteditable]:not([contenteditable="false"]),[translate="no"],.notranslate,[aria-hidden="true"],[data-lingualens-ui]';
 export const PENDING_CLASS = 'lingualens-node-pending';
@@ -893,7 +1005,8 @@ export function collectText(root: Node = document.body, ranges?: Range[]): TextS
     // Rendered content below the viewport is included; display:none and closed
     // details are excluded. This does not limit translation to the viewport.
     if (!rectRange.getClientRects().length) return;
-    let block = parent;
+    // Prefer semantic paragraphs over a styled inline descendant.
+    let block = parent.closest('p,h1,h2,h3,h4,h5,h6,li,dt,dd,td,th,figcaption,blockquote') ?? parent;
     while (block.parentElement && !/^(block|flow-root|list-item|table-cell|flex|grid)$/.test(getComputedStyle(block).display)) block = block.parentElement;
     const add = (start: number, end: number) => {
       const value = node.data.slice(start, end);
@@ -977,9 +1090,10 @@ export async function pageAction(command: PageCommand): Promise<PageStatus> {
 
 ````ts
 import type { TranslationController } from './translation-controller';
+import type { ViewMode } from '../types';
 
 /** The status UI lives in a ShadowRoot so host-page CSS cannot affect controls. */
-export function createPageToolbar(controller: TranslationController) {
+export function createPageToolbar(controller: TranslationController, changeView: (mode: ViewMode) => void | Promise<void> = (mode) => controller.show(mode)) {
   const host = document.createElement('div');
   host.dataset.lingualensUi = 'true';
   host.style.cssText = 'all:initial;position:fixed;right:20px;bottom:20px;z-index:2147483647;display:none;color-scheme:light;';
@@ -987,6 +1101,9 @@ export function createPageToolbar(controller: TranslationController) {
   const style = document.createElement('style');
   style.textContent = `*{box-sizing:border-box}section{font:14px/1.6 system-ui,sans-serif;color:#182230;width:340px;max-width:calc(100vw - 40px);background:#fff;border:1px solid #dbe2eb;border-radius:14px;box-shadow:0 8px 36px #18223024;padding:16px}header{display:flex;align-items:center;justify-content:space-between;font-weight:650}p{margin:9px 0;overflow-wrap:anywhere}button{font:inherit;border:1px solid #dbe2eb;background:#fff;padding:5px 10px;border-radius:7px;cursor:pointer;color:#243247}button:hover{background:#edf4ff}button:focus-visible{outline:2px solid #2563eb;outline-offset:2px}button:disabled{opacity:.5;cursor:wait}.actions{display:flex;gap:8px}.progress{height:4px;background:#e6edf8;border-radius:8px;margin:12px 0;overflow:hidden}.bar{height:100%;background:#2563eb;transition:width .2s}.failure{padding-top:10px;margin-top:10px;border-top:1px solid #e3e8ef}.failure p{font-size:13px}.errors{max-height:220px;overflow:auto}small{color:#53647a}button.close{border:0;padding:0 5px;font-size:20px;line-height:1.3}@media(prefers-reduced-motion:reduce){.bar{transition:none}}`;
   shadow.append(style);
+  const modeStyle = document.createElement('style');
+  modeStyle.textContent = '.modes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:12px 0}.mode[aria-pressed="true"]{color:#1d4ed8;background:#eff6ff;border-color:#bfdbfe}.mode{transition:background-color .15s}@media(prefers-reduced-motion:reduce){.mode{transition:none}}';
+  shadow.append(modeStyle);
   const section = document.createElement('section');
   section.setAttribute('aria-label', 'LinguaLens 翻译状态');
   const header = document.createElement('header');
@@ -997,19 +1114,27 @@ export function createPageToolbar(controller: TranslationController) {
   const progress = document.createElement('div'); progress.className = 'progress';
   const bar = document.createElement('div'); bar.className = 'bar'; progress.append(bar);
   const actions = document.createElement('div'); actions.className = 'actions';
-  const restore = document.createElement('button'); restore.textContent = '还原原文'; restore.onclick = () => controller.restore();
   const retry = document.createElement('button'); retry.textContent = '重试失败段落';
   const showError = (error: unknown) => { status.textContent = error instanceof Error ? error.message : '操作失败。'; };
+  const modes = document.createElement('div'); modes.className = 'modes'; modes.setAttribute('role', 'group'); modes.setAttribute('aria-label', '显示方式');
+  const buttons = new Map<ViewMode, HTMLButtonElement>();
+  for (const [mode, label] of [['original', '原文'], ['translated', '译文'], ['bilingual', '双语对照']] as const) {
+    const button = document.createElement('button'); button.className = 'mode'; button.textContent = label;
+    if (mode === 'original') button.setAttribute('aria-label', '还原原文');
+    button.onclick = () => { void Promise.resolve().then(() => changeView(mode)).catch(showError); };
+    buttons.set(mode, button); modes.append(button);
+  }
   retry.onclick = () => { try { controller.retry(); } catch (e) { showError(e); } };
-  actions.append(restore, retry);
+  actions.append(retry);
   const errors = document.createElement('div'); errors.className = 'errors';
-  section.append(header, status, progress, actions, errors); shadow.append(section);
+  section.append(header, status, progress, modes, actions, errors); shadow.append(section);
   let previousErrors = '';
   const mount = () => { if (!host.isConnected) document.documentElement.append(host); };
   return {
     update() {
       mount(); host.style.display = 'block';
       const state = controller.status;
+      for (const [mode, button] of buttons) button.setAttribute('aria-pressed', String(state.viewMode === mode));
       status.textContent = state.total
         ? !state.busy && state.failed ? `${state.completed} 段成功，${state.failed} 段失败` : `${state.message} · ${state.completed}/${state.total} 段`
         : state.message ?? '';
@@ -1209,92 +1334,164 @@ export async function saveSettings(settings: Settings): Promise<void> {
 export function renderPrompt(profile: ModelProfile): string {
   return profile.systemPrompt.replaceAll('{目标语言}', profile.targetLanguage).replaceAll('{targetLanguage}', profile.targetLanguage);
 }
+
+/** A page can identify its translation context without receiving the API key
+ * or the custom system prompt. Changing any translation input expires results.
+ */
+export async function translationContext(profile: ModelProfile): Promise<string> {
+  const source = JSON.stringify([profile.id, profile.baseUrl.trim(), profile.model.trim(), profile.targetLanguage, profile.systemPrompt]);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
 ````
 
 ## utils/translation-controller.ts
 
 ````ts
-import type { PageStatus, Segment, StreamEvent } from '../types';
+import type { PageStatus, Segment, StreamEvent, TranslationMode, ViewMode } from '../types';
 import type { TranslationTransport } from './content-transport';
 import { collectText, FAILED_CLASS, PENDING_CLASS, splitSlice, type TextSlice } from './dom';
+import { BilingualRenderer, sourceStructure } from './bilingual';
 
 interface CachedNode { original: string; lastWritten: string }
 interface Unit extends Segment { node: Text; start: number; end: number; translated?: string; done: boolean }
 interface Stage { base: string; units: Unit[] }
-export interface Paragraph { id: string; element: Element; hadClass: boolean; units: Unit[]; state: 'pending' | 'completed' | 'failed'; error?: string; preview: string }
+export interface Paragraph {
+  id: string; element: Element; hadClass: boolean; units: Unit[];
+  structure: ReturnType<typeof sourceStructure>;
+  state: 'pending' | 'completed' | 'failed'; error?: string; preview: string;
+}
 
+/** Originals and completed translations survive display changes for this page.
+ * Rendering, cancellation and cache disposal are deliberately separate actions.
+ */
 export class TranslationController {
   private cache = new Map<Text, CachedNode>();
   private stages = new Map<Text, Stage>();
   private units = new Map<string, Unit>();
   readonly paragraphs = new Map<string, Paragraph>();
+  private bilingual = new BilingualRenderer();
   private cancel?: () => void;
   private epoch = 0;
   private running = false;
   private message = '';
+  private cacheKey = '';
+  private mode: ViewMode = 'original';
+  private preferredMode: TranslationMode = 'translated';
+  private nextUnit = 0;
+  private nextGroup = 0;
   constructor(private readonly transport: TranslationTransport, private readonly changed: () => void) {}
 
   get status(): PageStatus {
     const values = [...this.paragraphs.values()];
-    return { busy: this.running, total: values.length, completed: values.filter((p) => p.state === 'completed').length, failed: values.filter((p) => p.state === 'failed').length, message: this.message };
+    const completed = values.filter((p) => p.state === 'completed').length;
+    return { busy: this.running, total: values.length, completed, failed: values.filter((p) => p.state === 'failed').length, viewMode: this.mode, cached: completed, message: this.message };
   }
 
-  page(): void {
-    if (this.running) throw new Error('正在翻译，可先还原原文以取消当前任务。');
-    this.restore(false);
-    this.prepare(collectText());
+  /** Expire a different model/language/prompt without exposing its credentials. */
+  refreshContext(cacheKey: string): void {
+    if (this.cacheKey && this.cacheKey !== cacheKey) {
+      this.dispose(); this.message = '翻译设置已更新，请重新翻译。'; this.changed();
+    }
+    this.cacheKey = cacheKey;
+    for (const p of this.paragraphs.values()) if (p.state !== 'failed' && !this.isCurrent(p)) this.invalidate(p);
   }
 
-  selection(ranges: Range[]): void {
+  page(cacheKey = 'default', mode?: TranslationMode, force = false): void {
+    const desired = mode ?? this.preferredMode;
+    this.refreshContext(cacheKey);
+    if (this.running && !force) { this.show(desired); return; }
+    if (force) { this.dispose(); this.cacheKey = cacheKey; }
+    this.bilingual.clear(); this.writeOriginals(); this.clearMarkers();
+    this.pruneInvalid();
+    this.prepare(collectText(), desired);
+  }
+
+  selection(ranges: Range[], cacheKey = 'default'): void {
     if (this.running) throw new Error('正在翻译，请等待完成，或先还原原文再重新选中。');
-    this.prepare(collectText(document.body, ranges));
+    const slices = collectText(document.body, ranges);
+    if (slices.some(({ node }) => { const c = this.cache.get(node); return c && node.data !== c.original; })) {
+      throw new Error('请先切换到原文，再选中需要翻译的内容。');
+    }
+    this.refreshContext(cacheKey);
+    this.bilingual.clear(); this.writeOriginals(); this.clearMarkers(); this.pruneInvalid();
+    this.prepare(slices, this.preferredMode);
   }
 
-  private prepare(slices: TextSlice[]): void {
+  private prepare(slices: TextSlice[], mode: TranslationMode): void {
     if (!slices.length) throw new Error('没有找到可翻译的可见文本。代码、输入框和不可见内容会被跳过。');
-    // A new selection may cover already translated nodes. Cache the first
-    // original, but use current text as this operation's offset coordinate base.
-    this.clearMarkers();
-    this.stages.clear(); this.units.clear(); this.paragraphs.clear();
-    const blocks = new Map<Element, Paragraph>();
-    let unitId = 0;
+    const blocks = new Map([...this.paragraphs.values()].map((p) => [p.element, p]));
+    const requested = new Set<Paragraph>();
     for (const slice of slices) {
       let paragraph = blocks.get(slice.block);
       if (!paragraph) {
-        paragraph = { id: `g${blocks.size}`, element: slice.block, hadClass: slice.block.hasAttribute('class'), units: [], state: 'pending', preview: '' };
+        paragraph = { id: `g${this.nextGroup++}`, element: slice.block, hadClass: slice.block.hasAttribute('class'), units: [], structure: sourceStructure(slice.block), state: 'pending', preview: '' };
         blocks.set(slice.block, paragraph); this.paragraphs.set(paragraph.id, paragraph);
       }
       let stage = this.stages.get(slice.node);
       if (!stage) {
-        stage = { base: slice.node.data, units: [] };
-        this.stages.set(slice.node, stage);
-        // If a framework edited this node, its new text becomes the new source;
-        // never restore a stale value over a live application update.
-        const old = this.cache.get(slice.node);
-        if (!old || old.lastWritten !== slice.node.data) this.cache.set(slice.node, { original: slice.node.data, lastWritten: slice.node.data });
+        stage = { base: slice.node.data, units: [] }; this.stages.set(slice.node, stage);
+        this.cache.set(slice.node, { original: slice.node.data, lastWritten: slice.node.data });
       }
-      for (const part of splitSlice(slice)) {
-        const unit: Unit = { id: `s${unitId++}`, groupId: paragraph.id, node: slice.node, ...part, done: false };
+      if (this.covered(stage, slice.start, slice.end)) continue;
+      // Expand an overlapping selection to existing source boundaries. A cached
+      // translation cannot be cut into words using source-language offsets.
+      let start = slice.start; let end = slice.end;
+      let expanded: boolean;
+      do {
+        expanded = false;
+        for (const u of stage.units) if (u.start < end && u.end > start && (u.start < start || u.end > end)) {
+          start = Math.min(start, u.start); end = Math.max(end, u.end); expanded = true;
+        }
+      } while (expanded);
+      const overlapping = stage.units.filter((u) => u.start < end && u.end > start);
+      for (const u of overlapping) this.units.delete(u.id);
+      stage.units = stage.units.filter((u) => !overlapping.includes(u));
+      paragraph.units = paragraph.units.filter((u) => !overlapping.includes(u));
+      for (const part of splitSlice({ ...slice, start, end })) {
+        const unit: Unit = { id: `s${this.nextUnit++}`, groupId: paragraph.id, node: slice.node, ...part, done: false };
         paragraph.units.push(unit); stage.units.push(unit); this.units.set(unit.id, unit);
-        paragraph.preview += part.text;
       }
+      paragraph.state = 'pending'; paragraph.error = undefined;
+      paragraph.preview = paragraph.units.map((u) => u.text).join(' ');
+      requested.add(paragraph);
     }
-    this.start([...this.paragraphs.values()]);
+    this.mode = mode; this.preferredMode = mode;
+    this.renderAll();
+    if (requested.size) this.start([...requested]);
+    else { this.message = '已显示缓存译文'; this.markers(); this.changed(); }
+  }
+
+  private covered(stage: Stage, start: number, end: number): boolean {
+    let cursor = start;
+    for (const u of [...stage.units].sort((a, b) => a.start - b.start)) {
+      if (!u.done || u.translated === undefined || u.end <= cursor || u.start >= end) continue;
+      if (stage.base.slice(cursor, u.start).trim()) return false;
+      cursor = Math.max(cursor, u.end);
+      if (cursor >= end) return true;
+    }
+    return !stage.base.slice(cursor, end).trim();
+  }
+
+  show(mode: ViewMode, cacheKey?: string): void {
+    if (mode === 'original') { this.restore(); return; }
+    if (cacheKey) this.refreshContext(cacheKey);
+    this.mode = mode; this.preferredMode = mode;
+    this.renderAll(); this.markers();
+    this.message = this.running ? '正在翻译' : this.status.cached ? mode === 'bilingual' ? '已显示双语对照' : '已显示缓存译文' : '请先翻译当前页面';
+    this.changed();
   }
 
   retry(groupId?: string): void {
     if (this.running) throw new Error('请等待当前翻译结束后重试。');
     const paragraphs = [...this.paragraphs.values()].filter((p) => p.state === 'failed' && (!groupId || p.id === groupId));
     if (!paragraphs.length) throw new Error('没有需要重试的段落。');
+    for (const p of paragraphs) if (!this.isCurrent(p)) throw new Error('页面已更新，请重新翻译当前页面。');
     for (const p of paragraphs) {
-      for (const unit of p.units) {
-        const cached = this.cache.get(unit.node);
-        if (!unit.node.isConnected || !cached || unit.node.data !== cached.lastWritten) throw new Error('页面已更新，请还原原文后重新翻译。');
-        unit.done = false; unit.translated = undefined;
-      }
+      for (const unit of p.units) { unit.done = false; unit.translated = undefined; }
       p.state = 'pending'; p.error = undefined;
     }
-    this.start(paragraphs);
+    this.mode = this.preferredMode; this.start(paragraphs);
   }
 
   private start(paragraphs: Paragraph[]): void {
@@ -1302,13 +1499,11 @@ export class TranslationController {
     const epoch = ++this.epoch;
     this.markers(); this.changed();
     try {
-      this.cancel = this.transport(paragraphs.flatMap((p) => p.units.map(({ id, groupId, text }) => ({ id, groupId, text }))), (event) => {
-        if (epoch !== this.epoch) return; // Ignore packets arriving after restore.
+      this.cancel = this.transport(paragraphs.flatMap((p) => p.units.filter((u) => !u.done).map(({ id, groupId, text }) => ({ id, groupId, text }))), (event) => {
+        if (epoch !== this.epoch) return;
         this.receive(event);
-      });
-    } catch (error) {
-      this.receive({ type: 'fatal', error: error instanceof Error ? error.message : '无法连接翻译后台。' });
-    }
+      }, this.cacheKey);
+    } catch (error) { this.receive({ type: 'fatal', error: error instanceof Error ? error.message : '无法连接翻译后台。' }); }
   }
 
   private receive(event: StreamEvent): void {
@@ -1318,13 +1513,17 @@ export class TranslationController {
       if (!unit) return;
       const p = this.paragraphs.get(unit.groupId)!;
       if (p.state !== 'pending') return;
-      if (event.type === 'delta') { unit.translated = event.text; this.render(unit.node); return; }
-      else { unit.done = true; if (p.units.every((u) => u.done)) p.state = 'completed'; }
+      if (!this.isCurrent(p)) { this.invalidate(p); return; }
+      if (event.type === 'delta') { unit.translated = event.text; this.renderParagraph(p); return; }
+      unit.done = true;
+      if (p.units.every((u) => u.done && u.translated !== undefined)) p.state = 'completed';
     } else if (event.type === 'reset') {
+      const dirty = new Set<Paragraph>();
       for (const id of event.ids) {
-        const u = this.units.get(id);
-        if (u && this.paragraphs.get(u.groupId)?.state === 'pending') { u.translated = undefined; u.done = false; this.render(u.node); }
+        const u = this.units.get(id); const p = u && this.paragraphs.get(u.groupId);
+        if (u && p?.state === 'pending') { u.translated = undefined; u.done = false; dirty.add(p); }
       }
+      dirty.forEach((p) => this.renderParagraph(p));
     } else if (event.type === 'failed') {
       for (const group of new Set(event.ids.map((id) => this.units.get(id)?.groupId))) if (group) this.fail(this.paragraphs.get(group)!, event.error);
     } else if (event.type === 'fatal') {
@@ -1338,31 +1537,70 @@ export class TranslationController {
     this.markers(); this.changed();
   }
 
-  private fail(paragraph: Paragraph, error: string): void {
-    paragraph.state = 'failed'; paragraph.error = error;
-    const nodes = new Set<Text>();
-    for (const unit of paragraph.units) { unit.translated = undefined; unit.done = false; nodes.add(unit.node); }
-    nodes.forEach((node) => this.render(node));
+  private isCurrent(p: Paragraph): boolean {
+    if (!p.element.isConnected) return false;
+    for (const u of p.units) {
+      const cached = this.cache.get(u.node);
+      if (!cached || !u.node.isConnected || u.node.data !== cached.lastWritten) return false;
+    }
+    const structure = sourceStructure(p.element);
+    return structure.length === p.structure.length && structure.every((s, i) => {
+      const previous = p.structure[i]!;
+      return s.node === previous.node && s.parent === previous.parent && s.node.data === (this.cache.get(s.node)?.lastWritten ?? previous.source);
+    });
   }
 
-  private render(node: Text): void {
+  private invalidate(p: Paragraph): void {
+    for (const u of p.units) {
+      const c = this.cache.get(u.node);
+      if (c && (!u.node.isConnected || u.node.data !== c.lastWritten)) this.cache.delete(u.node);
+    }
+    this.fail(p, '页面内容已更新，请重新翻译。'); this.markers(); this.changed();
+  }
+
+  private fail(p: Paragraph, error: string): void {
+    p.state = 'failed'; p.error = error;
+    for (const unit of p.units) { unit.translated = undefined; unit.done = false; }
+    this.bilingual.remove(p.element);
+    for (const node of new Set(p.units.map((u) => u.node))) this.writeOriginal(node);
+  }
+
+  private translatedValue(node: Text): string {
     const stage = this.stages.get(node);
-    const cached = this.cache.get(node);
-    if (!stage || !cached) return;
-    if (!node.isConnected || node.data !== cached.lastWritten) {
-      // A page framework owns the new text. Drop the old restoration snapshot.
-      this.cache.delete(node);
-      for (const groupId of new Set(stage.units.map((unit) => unit.groupId))) this.fail(this.paragraphs.get(groupId)!, '页面在翻译期间更新了内容，请重新翻译。');
-      this.markers(); this.changed();
-      return;
-    }
+    if (!stage) return node.data;
     let text = ''; let cursor = 0;
-    for (const unit of [...stage.units].sort((a, b) => a.start - b.start)) {
-      text += stage.base.slice(cursor, unit.start) + (unit.translated ?? stage.base.slice(unit.start, unit.end));
-      cursor = unit.end;
+    for (const u of [...stage.units].sort((a, b) => a.start - b.start)) {
+      text += stage.base.slice(cursor, u.start) + (u.translated ?? stage.base.slice(u.start, u.end)); cursor = u.end;
     }
-    text += stage.base.slice(cursor);
-    node.data = text; cached.lastWritten = text;
+    return text + stage.base.slice(cursor);
+  }
+
+  private renderParagraph(p: Paragraph): void {
+    if (!this.isCurrent(p)) { if (p.state !== 'failed') this.invalidate(p); return; }
+    const owned = new Set(p.units.map((u) => u.node));
+    for (const node of owned) {
+      const c = this.cache.get(node)!;
+      const text = this.mode === 'translated' ? this.translatedValue(node) : c.original;
+      node.data = text; c.lastWritten = text;
+    }
+    if (this.mode === 'bilingual' && p.state !== 'failed' && p.units.some((u) => u.translated?.trim())) this.bilingual.update(p.element, p.id, owned, (node) => this.translatedValue(node));
+    else this.bilingual.remove(p.element);
+  }
+
+  private renderAll(): void { for (const p of this.paragraphs.values()) this.renderParagraph(p); }
+  private writeOriginal(node: Text): boolean {
+    const c = this.cache.get(node);
+    if (!c || !node.isConnected || node.data !== c.lastWritten) return false;
+    node.data = c.original; c.lastWritten = c.original; return true;
+  }
+  private writeOriginals(): number { let count = 0; for (const node of this.cache.keys()) if (this.writeOriginal(node)) count++; return count; }
+
+  private pruneInvalid(): void {
+    for (const p of this.paragraphs.values()) if (!this.isCurrent(p)) {
+      this.bilingual.remove(p.element);
+      for (const u of p.units) { this.units.delete(u.id); this.cache.delete(u.node); this.stages.delete(u.node); }
+      this.paragraphs.delete(p.id);
+    }
   }
 
   private clearMarkers(): void {
@@ -1371,24 +1609,34 @@ export class TranslationController {
       if (!p.hadClass && p.element.getAttribute('class') === '') p.element.removeAttribute('class');
     }
   }
-
   private markers(): void {
     this.clearMarkers();
-    // Several independently selected fragments can share a block element.
+    if (this.mode === 'original') return;
     for (const p of this.paragraphs.values()) {
       if (p.state === 'pending' && this.running) p.element.classList.add(PENDING_CLASS);
       if (p.state === 'failed') p.element.classList.add(FAILED_CLASS);
     }
   }
 
+  /** Cancel incomplete work, but keep completed translations for instant reuse. */
   restore(notify = true): number {
     this.epoch++; this.cancel?.(); this.cancel = undefined; this.running = false;
-    let restored = 0;
-    for (const [node, cached] of this.cache) if (node.isConnected && node.data === cached.lastWritten) { node.data = cached.original; restored++; }
-    this.clearMarkers(); this.cache.clear(); this.stages.clear(); this.units.clear(); this.paragraphs.clear();
-    this.message = `已还原原文（${restored} 个文本节点）`;
+    for (const p of this.paragraphs.values()) if (p.state === 'pending') {
+      for (const u of p.units) if (!u.done) u.translated = undefined;
+      // Only a whole validated paragraph is reusable after cancellation.
+      if (!p.units.every((u) => u.done)) for (const u of p.units) { u.translated = undefined; u.done = false; }
+    }
+    this.mode = 'original'; this.bilingual.clear();
+    const restored = this.writeOriginals(); this.clearMarkers();
+    this.message = this.status.cached ? '已还原原文，译文已保留' : `已还原原文（${restored} 个文本节点）`;
     if (notify) this.changed();
     return restored;
+  }
+
+  /** Navigation, extension invalidation and explicit retranslation release data. */
+  dispose(): void {
+    this.restore(false); this.cache.clear(); this.stages.clear(); this.units.clear(); this.paragraphs.clear();
+    this.cacheKey = ''; this.nextUnit = 0; this.nextGroup = 0;
   }
 }
 ````
@@ -1419,7 +1667,11 @@ export interface PublicSettings {
   profileName: string;
   model: string;
   targetLanguage: string;
+  cacheKey: string;
 }
+
+export type ViewMode = 'original' | 'translated' | 'bilingual';
+export type TranslationMode = Exclude<ViewMode, 'original'>;
 
 /** Each source segment belongs to a paragraph, but never contains HTML. */
 export interface Segment {
@@ -1429,7 +1681,7 @@ export interface Segment {
 }
 
 export type StreamRequest =
-  | { type: 'translate'; segments: Segment[] }
+  | { type: 'translate'; segments: Segment[]; cacheKey?: string }
   | { type: 'ping' }
   | { type: 'cancel' };
 
@@ -1443,9 +1695,10 @@ export type StreamEvent =
   | { type: 'pong' };
 
 export type PageCommand =
-  | { type: 'page' }
+  | { type: 'page'; mode?: TranslationMode; force?: boolean }
   | { type: 'selection'; selectionText: string }
   | { type: 'restore' }
+  | { type: 'view'; mode: ViewMode }
   | { type: 'retry'; groupId?: string }
   | { type: 'status' }
   | { type: 'ping' }
@@ -1456,6 +1709,8 @@ export interface PageStatus {
   total: number;
   completed: number;
   failed: number;
+  viewMode: ViewMode;
+  cached: number;
   restored?: number;
   message?: string;
 }
@@ -1901,6 +2156,7 @@ let origin: string;
 let extensionId: string;
 let userDataDir: string;
 let failedOnce = false;
+let translationRequests = 0;
 const fixture = `<!doctype html><html lang="en"><head><meta charset="UTF-8"><title>LinguaLens test article</title><style>body{max-width:720px;margin:70px auto;font:18px/1.8 system-ui;color:#182230}h1{font-size:34px}pre{background:#f1f5f9;padding:20px}a{color:#2563eb}button{padding:10px}</style></head><body><h1>Read beyond borders.</h1><p id="first">Hello <strong>world</strong>. Read <a href="#more">more stories</a> today.</p><p id="second">Translation keeps the original meaning and the number 2026.</p><p id="failure">FAIL paragraph for a single retry.</p><p id="more">Keep your links, emphasis, and page interactions.</p><pre><code>const original = "DO NOT TRANSLATE";</code></pre><div hidden>Hidden content stays unchanged.</div><div contenteditable="true">Editable draft stays unchanged.</div><button id="counter">Click counter</button></body></html>`;
 
 test.beforeAll(async () => {
@@ -1909,6 +2165,7 @@ test.beforeAll(async () => {
     const parts: Buffer[] = [];
     for await (const part of req) parts.push(Buffer.from(part));
     const body = JSON.parse(Buffer.concat(parts).toString()) as { messages: { content: string }[] };
+    if (body.messages.at(-1)?.content !== 'Reply OK.') translationRequests++;
     if (req.url?.startsWith('/unauthorized') || req.headers.authorization !== 'Bearer fixture-key') { res.writeHead(401); res.end('{}'); return; }
     const user = body.messages.at(-1)!.content;
     if (req.url?.startsWith('/fail-once') && user.includes('FAIL') && !failedOnce) { failedOnce = true; res.writeHead(400); res.end('{}'); return; }
@@ -1955,6 +2212,7 @@ async function configure(path = '/v1') {
   await page.getByLabel('API Base URL', { exact: true }).fill(origin + path);
   await page.getByLabel('API Key', { exact: true }).fill('fixture-key');
   await page.getByLabel('模型名称', { exact: true }).fill('fixture-translator');
+  await page.getByLabel('目标语言', { exact: true }).fill('简体中文');
   await page.getByRole('button', { name: '保存配置', exact: true }).click();
   await expect(page.getByRole('status').filter({ hasText: '配置已保存' })).toBeVisible();
   return page;
@@ -2092,6 +2350,106 @@ test('selection context snapshot, restoration cancellation and real popup action
   await expect(page.locator('#first')).toHaveText('Hello world. Read more stories today.');
   await popup.close(); await page.close();
 });
+
+test('cached original/translated/bilingual switches make no API requests', async () => {
+  const options = await configure(); await options.close();
+  const page = await context.newPage(); await page.goto(origin + '/cached-switches');
+  await page.evaluate(() => { Object.assign(window, { originalLink: document.querySelector('#first a') }); });
+  await command(page.url(), { type: 'page' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  const requestsAfterTranslation = translationRequests;
+  await command(page.url(), { type: 'restore' });
+  await expect(page.locator('#first')).toHaveText('Hello world. Read more stories today.');
+  const popup = await context.newPage(); await popup.goto(`chrome-extension://${extensionId}/popup.html`); await page.bringToFront();
+  await expect(popup.getByRole('button', { name: '还原原文', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  for (let i = 0; i < 2; i++) {
+    await popup.getByRole('button', { name: '双语对照', exact: true }).click();
+    await expect(page.locator('#first [data-lingualens-translation] section')).toContainText('译：Hello');
+    expect(await page.locator('#first').evaluate((p) => p.textContent)).toBe('Hello world. Read more stories today.');
+    await expect(page.locator('#first [data-lingualens-translation] strong')).toHaveText('译：world');
+    await expect(page.locator('[data-lingualens-translation]')).toHaveCount(5);
+    await page.locator('#first').evaluate((p) => {
+      const host = p.querySelector('[data-lingualens-translation]')!;
+      const range = document.createRange(); range.setStart(p, 0); range.setEndBefore(host);
+      if (host.getBoundingClientRect().top < range.getBoundingClientRect().bottom) throw new Error('Translation is not below its original paragraph');
+    });
+    if (i === 0) {
+      await popup.locator('main').screenshot({ path: 'artifacts/screenshots/popup-bilingual.png', animations: 'disabled' });
+      await page.screenshot({ path: 'artifacts/screenshots/page-bilingual.png', fullPage: true, animations: 'disabled' });
+    }
+    await popup.getByRole('button', { name: '还原原文', exact: true }).click();
+    await expect(page.locator('[data-lingualens-translation]')).toHaveCount(0);
+    await popup.getByRole('button', { name: '译文', exact: true }).click();
+    await expect(page.locator('#first')).toContainText('译：Hello');
+    expect(translationRequests).toBe(requestsAfterTranslation);
+  }
+  expect(await page.evaluate(() => document.querySelector('#first a') === (window as typeof window & { originalLink: Element }).originalLink)).toBe(true);
+  await popup.getByRole('button', { name: '重新翻译', exact: true }).click();
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  expect(translationRequests).toBeGreaterThan(requestsAfterTranslation);
+  await popup.close(); await page.close();
+});
+
+test('bilingual mode starts with original text and rolls back a failed paragraph', async () => {
+  failedOnce = false;
+  const options = await configure('/fail-once/v1'); await options.close();
+  const page = await context.newPage(); await page.goto(origin + '/bilingual-first');
+  await command(page.url(), { type: 'page', mode: 'bilingual' });
+  await expect(page.locator('#first [data-lingualens-translation] section')).toContainText('译：Hello');
+  expect(await page.locator('#first').evaluate((p) => p.textContent)).toBe('Hello world. Read more stories today.');
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  await expect(page.locator('#failure [data-lingualens-translation]')).toHaveCount(0);
+  await expect(page.locator('#failure')).toHaveText('FAIL paragraph for a single retry.');
+  await command(page.url(), { type: 'retry', groupId: 'g3' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  await expect(page.locator('#failure [data-lingualens-translation] section')).toContainText('译：FAIL');
+  const requestsAfterTranslation = translationRequests;
+  await command(page.url(), { type: 'restore' }); await command(page.url(), { type: 'page', mode: 'bilingual' });
+  expect(translationRequests).toBe(requestsAfterTranslation);
+  await expect(page.locator('[data-lingualens-translation]')).toHaveCount(5);
+  await page.close();
+});
+
+test('language/model/prompt changes expire cache without sending a translation request', async () => {
+  const options = await configure();
+  const page = await context.newPage(); await page.goto(origin + '/context-expiry');
+  await command(page.url(), { type: 'page' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  const changes: [string, string][] = [['目标语言', 'English'], ['模型名称', 'fixture-translator-v2'], ['系统 Prompt', '请忠实翻译为{目标语言}，只输出译文。']];
+  for (const [field, value] of changes) {
+    const before = translationRequests;
+    await options.getByLabel(field, { exact: true }).fill(value);
+    await options.getByRole('button', { name: '保存配置', exact: true }).click();
+    await expect(options.getByText('配置已保存。', { exact: true })).toBeVisible();
+    const state = await command(page.url(), { type: 'status' }) as { cached: number };
+    expect(state.cached).toBe(0);
+    await expect(page.locator('#first')).toHaveText('Hello world. Read more stories today.');
+    await command(page.url(), { type: 'view', mode: 'translated' }); expect(translationRequests).toBe(before);
+    await command(page.url(), { type: 'page' });
+    await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+    expect(translationRequests).toBeGreaterThan(before);
+  }
+  await options.close(); await page.close();
+});
+
+test('a source edit invalidates one cached paragraph and preserves the others', async () => {
+  const options = await configure(); await options.close();
+  const page = await context.newPage(); await page.goto(origin + '/edited-source');
+  await command(page.url(), { type: 'page' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  const before = translationRequests;
+  await command(page.url(), { type: 'restore' });
+  await page.locator('#first').evaluate((p) => { p.firstChild!.textContent = 'Changed text '; });
+  await command(page.url(), { type: 'view', mode: 'translated' });
+  await expect(page.locator('#first')).toContainText('Changed text'); expect(translationRequests).toBe(before);
+  await command(page.url(), { type: 'page' });
+  await expect.poll(async () => (await command(page.url(), { type: 'status' }) as { busy: boolean }).busy).toBe(false);
+  expect(translationRequests).toBe(before + 1);
+  await expect(page.locator('#first')).toContainText('译：Changed text');
+  await command(page.url(), { type: 'restore' });
+  await expect(page.locator('#first')).toHaveText('Changed text world. Read more stories today.');
+  await page.close();
+});
 ````
 
 ## tests/protocol.test.ts
@@ -2155,6 +2513,205 @@ it('limits work across sessions and aborts queued tasks', async () => {
   cancel.abort(); await expect(second).rejects.toThrow('已取消');
   release(); await first; expect(called).toBe(false);
   await expect(slots.use(new AbortController().signal, async () => 'ready')).resolves.toBe('ready');
+});
+````
+
+## tests/settings.test.ts
+
+````ts
+import { webcrypto } from 'node:crypto';
+import { afterEach, expect, it, vi } from 'vitest';
+import { newProfile } from '../utils/defaults';
+import { translationContext } from '../utils/settings';
+
+afterEach(() => vi.unstubAllGlobals());
+
+it('keys results by translation inputs, while keeping credentials out of the context', async () => {
+  vi.stubGlobal('crypto', webcrypto);
+  const profile = newProfile();
+  const original = await translationContext(profile);
+  expect(original).toMatch(/^[a-f0-9]{64}$/);
+  expect(await translationContext({ ...profile, apiKey: 'a-different-test-key', name: 'Renamed profile' })).toBe(original);
+  for (const patch of [{ id: 'another-profile' }, { baseUrl: 'https://example.com/v1' }, { model: 'another-model' }, { targetLanguage: 'English' }, { systemPrompt: 'Different translation instructions' }]) {
+    expect(await translationContext({ ...profile, ...patch })).not.toBe(original);
+  }
+});
+````
+
+## tests/view-modes.test.ts
+
+````ts
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TranslationController } from '../utils/translation-controller';
+import { collectText } from '../utils/dom';
+import type { Segment, StreamEvent } from '../types';
+
+beforeEach(() => {
+  document.body.innerHTML = '';
+  Object.defineProperty(Range.prototype, 'getClientRects', { configurable: true, value: () => [{ width: 10, height: 10 }] });
+});
+
+function harness() {
+  const calls: { segments: Segment[]; receive: (event: StreamEvent) => void }[] = [];
+  const cancel = vi.fn();
+  const controller = new TranslationController((segments, receive) => { calls.push({ segments, receive }); return cancel; }, () => undefined);
+  const latest = () => calls.at(-1)!;
+  const complete = () => {
+    for (const s of latest().segments) { latest().receive({ type: 'delta', id: s.id, text: `中:${s.text}` }); latest().receive({ type: 'complete', id: s.id }); }
+    latest().receive({ type: 'finished' });
+  };
+  return { controller, calls, cancel, complete, latest };
+}
+
+function translation(element: Element): HTMLElement | null {
+  return element.querySelector<HTMLElement>('[data-lingualens-translation]');
+}
+
+describe('retained translations and bilingual display', () => {
+  it('switches original/translated/bilingual repeatedly without another API request', () => {
+    document.body.innerHTML = '<p>Hello <strong>world</strong>.</p>';
+    const original = document.body.innerHTML;
+    const strong = document.querySelector('strong')!;
+    const h = harness(); h.controller.page('profile-a'); h.complete();
+    for (let i = 0; i < 3; i++) {
+      h.controller.restore(); expect(document.body.innerHTML).toBe(original);
+      expect(h.controller.status).toMatchObject({ viewMode: 'original', cached: 1 });
+      h.controller.show('translated', 'profile-a'); expect(document.querySelector('p')!.textContent).toBe('中:Hello 中:world.');
+      h.controller.show('bilingual', 'profile-a');
+      expect(document.querySelector('p')!.textContent).toBe('Hello world.');
+      expect(document.querySelector('p')!.lastChild).toBe(translation(document.querySelector('p')!));
+      expect(translation(document.querySelector('p')!)!.shadowRoot!.textContent).toContain('中:Hello 中:world.');
+    }
+    expect(document.querySelector('strong')).toBe(strong);
+    expect(h.calls).toHaveLength(1);
+    h.controller.restore(); h.controller.page('profile-a'); expect(h.calls).toHaveLength(1);
+  });
+
+  it('streams below original text and preserves inline links, emphasis and code safely', () => {
+    document.body.innerHTML = '<p id="source">Read <a id="source-link" href="/docs" onclick="bad()"><strong>the docs</strong></a> with <code>foo()</code> in 2026.</p>';
+    const p = document.querySelector('p')!;
+    const link = document.querySelector('a')!;
+    const originalText = p.textContent;
+    const h = harness(); h.controller.page('a', 'bilingual');
+    const first = h.latest().segments[0]!;
+    h.latest().receive({ type: 'delta', id: first.id, text: '<img src=x onerror=bad()>阅读' });
+    expect(p.textContent).toBe(originalText);
+    const shadow = translation(p)!.shadowRoot!;
+    expect(shadow.querySelector('img')).toBeNull();
+    expect(shadow.querySelector('section')!.textContent).toContain('<img src=x onerror=bad()>阅读');
+    h.complete();
+    expect(shadow.querySelector('a')!.getAttribute('href')).toBe(new URL('/docs', document.baseURI).href);
+    expect(shadow.querySelector('a')!.hasAttribute('onclick')).toBe(false);
+    expect(shadow.querySelector('[id]')).toBeNull();
+    expect(shadow.querySelector('strong')!.textContent).toBe('中:the docs');
+    expect(shadow.querySelector('code')!.textContent).toBe('foo()');
+    expect(document.querySelector('a')).toBe(link);
+    expect(collectText().map((s) => s.node.data)).not.toContain('中:the docs');
+    h.controller.restore(); expect(translation(p)).toBeNull(); expect(p.textContent).toBe(originalText);
+  });
+
+  it('keeps list and table structure valid, with the translation inside its paragraph', () => {
+    document.body.innerHTML = '<ul><li>Alpha</li></ul><table><tbody><tr><td>Beta</td></tr></tbody></table>';
+    const original = document.body.innerHTML;
+    const h = harness(); h.controller.page('a', 'bilingual'); h.complete();
+    for (const element of document.querySelectorAll('li,td')) {
+      const host = translation(element)!;
+      expect(host.tagName).toBe('SPAN'); expect(host.parentElement).toBe(element);
+      expect(host.shadowRoot!.querySelector('section')!.textContent).toContain('中:');
+    }
+    h.controller.restore(); expect(document.body.innerHTML).toBe(original);
+  });
+
+  it('retains completed paragraphs when cancelling and rejects late packets', () => {
+    document.body.innerHTML = '<p>Alpha</p><p>Beta</p>';
+    const h = harness(); h.controller.page('a');
+    const request = h.latest(); const [a, b] = request.segments;
+    request.receive({ type: 'delta', id: a!.id, text: '甲' }); request.receive({ type: 'complete', id: a!.id });
+    request.receive({ type: 'delta', id: b!.id, text: '未完成' });
+    h.controller.restore(); request.receive({ type: 'delta', id: b!.id, text: '迟到内容' });
+    expect(document.body.textContent).toBe('AlphaBeta');
+    h.controller.show('translated', 'a');
+    expect(document.body.textContent).toBe('甲Beta'); expect(h.calls).toHaveLength(1);
+    h.controller.page('a'); expect(h.latest().segments.map((s) => s.text)).toEqual(['Beta']);
+    expect(h.calls).toHaveLength(2);
+  });
+
+  it('reuses cached paragraphs and translates only newly added content', () => {
+    document.body.innerHTML = '<p>Alpha</p>';
+    const h = harness(); h.controller.page('a'); h.complete(); h.controller.restore();
+    const next = document.createElement('p'); next.textContent = 'Beta'; document.body.append(next);
+    h.controller.page('a'); expect(h.latest().segments.map((s) => s.text)).toEqual(['Beta']); h.complete();
+    expect(document.body.textContent).toBe('中:Alpha中:Beta'); expect(h.controller.status.cached).toBe(2);
+  });
+
+  it('expires cached text on a context change and supports explicit retranslation', () => {
+    document.body.innerHTML = '<p>Alpha</p>';
+    const h = harness(); h.controller.page('a'); h.complete(); h.controller.restore();
+    h.controller.show('translated', 'b');
+    expect(document.body.textContent).toBe('Alpha'); expect(h.controller.status.cached).toBe(0); expect(h.calls).toHaveLength(1);
+    h.controller.page('b'); expect(h.calls).toHaveLength(2); h.complete();
+    h.controller.page('b', undefined, true); expect(h.calls).toHaveLength(3);
+  });
+
+  it('does not overwrite external edits and refreshes only the changed paragraph', () => {
+    document.body.innerHTML = '<p>Alpha</p><p>Beta</p>';
+    const h = harness(); h.controller.page('a'); h.complete(); h.controller.restore();
+    document.querySelector('p')!.firstChild!.textContent = 'Updated';
+    h.controller.show('bilingual', 'a');
+    expect(document.querySelector('p')!.textContent).toBe('Updated'); expect(translation(document.querySelector('p')!)).toBeNull();
+    h.controller.page('a'); expect(h.latest().segments.map((s) => s.text)).toEqual(['Updated']);
+    h.complete(); expect(h.controller.status.cached).toBe(2);
+  });
+
+  it('invalidates translations when source nodes are inserted or replaced', () => {
+    document.body.innerHTML = '<p>Alpha</p>';
+    const h = harness(); h.controller.page('a'); h.complete(); h.controller.restore();
+    const p = document.querySelector('p')!; p.append(document.createTextNode(' added'));
+    h.controller.show('bilingual', 'a');
+    expect(translation(p)).toBeNull(); expect(p.textContent).toBe('Alpha added');
+    h.controller.page('a'); expect(h.latest().segments.map((s) => s.text)).toEqual(['Alpha', 'added']);
+  });
+
+  it('accumulates non-overlapping selections in the same paragraph', () => {
+    document.body.innerHTML = '<p>Alpha and Beta</p>';
+    const node = document.querySelector('p')!.firstChild!;
+    const first = document.createRange(); first.setStart(node, 0); first.setEnd(node, 5);
+    const h = harness(); h.controller.selection([first], 'a'); h.complete(); h.controller.restore();
+    const second = document.createRange(); second.setStart(node, 10); second.setEnd(node, 14);
+    h.controller.selection([second], 'a'); expect(h.latest().segments.map((s) => s.text)).toEqual(['Beta']); h.complete();
+    expect(node.textContent).toBe('中:Alpha and 中:Beta');
+    h.controller.restore(); h.controller.show('translated', 'a');
+    expect(node.textContent).toBe('中:Alpha and 中:Beta'); expect(h.calls).toHaveLength(2);
+  });
+
+  it('expires a paragraph when an untranslated number node changes', () => {
+    document.body.innerHTML = '<p>There are <span>12</span> items.</p>';
+    const h = harness(); h.controller.page('a'); h.complete(); h.controller.restore();
+    document.querySelector('span')!.firstChild!.textContent = '27';
+    h.controller.show('bilingual', 'a');
+    expect(translation(document.querySelector('p')!)).toBeNull();
+    expect(document.querySelector('p')!.textContent).toBe('There are 27 items.');
+    expect(h.controller.status.cached).toBe(0);
+  });
+
+  it('rolls back an invalid bilingual response and can retry that paragraph', () => {
+    document.body.innerHTML = '<p>Alpha <strong>Beta</strong></p>';
+    const h = harness(); h.controller.page('a', 'bilingual');
+    h.latest().receive({ type: 'delta', id: h.latest().segments[0]!.id, text: '甲' });
+    expect(translation(document.querySelector('p')!)).not.toBeNull();
+    h.latest().receive({ type: 'failed', ids: [h.latest().segments[0]!.id], error: 'invalid response' });
+    h.latest().receive({ type: 'finished' });
+    expect(translation(document.querySelector('p')!)).toBeNull(); expect(document.body.textContent).toBe('Alpha Beta');
+    h.controller.retry(); h.complete();
+    expect(translation(document.querySelector('p')!)!.shadowRoot!.querySelector('section')!.textContent).toBe('中:Alpha 中:Beta');
+  });
+
+  it('releases original and translated snapshots only when disposing the page session', () => {
+    document.body.innerHTML = '<p>Alpha</p>';
+    const h = harness(); h.controller.page('a', 'bilingual'); h.complete(); h.controller.dispose();
+    expect(document.body.innerHTML).toBe('<p>Alpha</p>');
+    expect(h.controller.status).toMatchObject({ total: 0, cached: 0, viewMode: 'original' });
+  });
 });
 ````
 

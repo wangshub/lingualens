@@ -1,6 +1,6 @@
 import type { Segment, StreamEvent } from '../types';
 import { ApiError, abortableDelay, errorMessage, streamChat } from './api';
-import { activeProfile, loadSettings, renderPrompt, validateProfile } from './settings';
+import { activeProfile, loadSettings, renderPrompt, translationContext, validateProfile } from './settings';
 import { batchSegments, encodeSegments, TRANSPORT_PROMPT, TranslationDecoder } from './protocol';
 import { Semaphore } from './scheduler';
 
@@ -23,11 +23,12 @@ export function validateSegments(value: unknown): asserts value is Segment[] {
 /** Each batch is validated before a complete event is emitted. Failed paragraphs
  * are rolled back by the content controller, including their earlier batches.
  */
-export async function translateSegments(segments: Segment[], signal: AbortSignal, send: (event: StreamEvent) => void): Promise<void> {
+export async function translateSegments(segments: Segment[], signal: AbortSignal, send: (event: StreamEvent) => void, cacheKey?: string): Promise<void> {
   validateSegments(segments);
   const settings = await loadSettings();
   const profile = activeProfile(settings);
   validateProfile(profile);
+  if (cacheKey && cacheKey !== await translationContext(profile)) throw new Error('模型配置已更新，请重新开始翻译。');
   const batches = batchSegments(segments, settings.batchBytes);
   const failedGroups = new Set<string>();
   let fatalError: unknown;

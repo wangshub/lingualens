@@ -49,3 +49,12 @@ export async function saveSettings(settings: Settings): Promise<void> {
 export function renderPrompt(profile: ModelProfile): string {
   return profile.systemPrompt.replaceAll('{目标语言}', profile.targetLanguage).replaceAll('{targetLanguage}', profile.targetLanguage);
 }
+
+/** A page can identify its translation context without receiving the API key
+ * or the custom system prompt. Changing any translation input expires results.
+ */
+export async function translationContext(profile: ModelProfile): Promise<string> {
+  const source = JSON.stringify([profile.id, profile.baseUrl.trim(), profile.model.trim(), profile.targetLanguage, profile.systemPrompt]);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}

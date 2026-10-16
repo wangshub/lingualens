@@ -1,6 +1,6 @@
 import { defineBackground } from 'wxt/utils/define-background';
 import type { ModelProfile, PageCommand, Reply, StreamEvent, StreamRequest } from '../types';
-import { activeProfile, loadSettings, saveSettings, validateProfile } from '../utils/settings';
+import { activeProfile, loadSettings, saveSettings, translationContext, validateProfile } from '../utils/settings';
 import { ApiError, errorMessage, streamChat } from '../utils/api';
 import { translateSegments } from '../utils/background-translation';
 
@@ -15,6 +15,8 @@ export default defineBackground(() => {
     await chrome.contextMenus.removeAll();
     chrome.contextMenus.create({ id: 'selection', title: '翻译选中内容', contexts: ['selection'] });
     chrome.contextMenus.create({ id: 'page', title: '翻译整个页面', contexts: ['page'] });
+    chrome.contextMenus.create({ id: 'bilingual', title: '双语对照整个页面', contexts: ['page'] });
+    chrome.contextMenus.create({ id: 'show-translated', title: '显示缓存译文', contexts: ['all'] });
     chrome.contextMenus.create({ id: 'restore', title: '还原原文', contexts: ['all'] });
     chrome.contextMenus.create({ id: 'retry', title: '重试失败段落', contexts: ['all'] });
   };
@@ -28,7 +30,7 @@ export default defineBackground(() => {
       try { await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ['content-scripts/content.js'] }); }
       catch { throw new Error('当前页面不允许注入插件。请打开普通网页；安装或更新插件后也可刷新页面再试。'); }
     }
-    const response = command.type === 'restore'
+    const response = command.type === 'restore' || (command.type === 'view' && command.mode === 'original')
       ? await chrome.tabs.sendMessage(tabId, command)
       : await chrome.tabs.sendMessage(tabId, command, { frameId });
     if (response && typeof response === 'object' && 'error' in response) throw new Error(String(response.error));
@@ -42,6 +44,8 @@ export default defineBackground(() => {
     const command: PageCommand = info.menuItemId === 'selection'
       ? { type: 'selection', selectionText: info.selectionText ?? '' }
       : info.menuItemId === 'restore' ? { type: 'restore' }
+      : info.menuItemId === 'bilingual' ? { type: 'page', mode: 'bilingual' }
+      : info.menuItemId === 'show-translated' ? { type: 'view', mode: 'translated' }
       : info.menuItemId === 'retry' ? { type: 'retry' } : { type: 'page' };
     void dispatch(tab.id, command, info.frameId ?? 0).catch(async (error: unknown) => {
       // The page toast is preferred; the action badge still works on blocked pages.
@@ -60,7 +64,7 @@ export default defineBackground(() => {
       await storageReady;
       if (msg.type === 'public-settings') {
         const p = activeProfile(await loadSettings());
-        return { profileName: p.name, model: p.model, targetLanguage: p.targetLanguage };
+        return { profileName: p.name, model: p.model, targetLanguage: p.targetLanguage, cacheKey: await translationContext(p) };
       }
       if (msg.type === 'dispatch' && trusted && typeof msg.tabId === 'number' && msg.command && typeof msg.command === 'object') {
         return dispatch(msg.tabId, msg.command as PageCommand);
@@ -91,7 +95,7 @@ export default defineBackground(() => {
       if (message.type === 'cancel') { controller.abort(); return; }
       if (message.type !== 'translate' || started) return;
       started = true;
-      void storageReady.then(() => translateSegments(message.segments, controller.signal, send)).catch((error: unknown) => send({ type: 'fatal', error: errorMessage(error) }));
+      void storageReady.then(() => translateSegments(message.segments, controller.signal, send, message.cacheKey)).catch((error: unknown) => send({ type: 'fatal', error: errorMessage(error) }));
     });
   });
 });
