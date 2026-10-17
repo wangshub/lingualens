@@ -1,53 +1,44 @@
-<div align="center">
-  <img src="public/icon-128.png" width="72" height="72" alt="LinguaLens" />
-  <h1>LinguaLens</h1>
-  <p>使用自己的 AI 服务，原地翻译网页，随时还原原文。</p>
-  <p>
-    <a href="https://github.com/wangshub/lingualens/actions/workflows/ci.yml"><img src="https://github.com/wangshub/lingualens/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" /></a>
-  </p>
-</div>
+<p align="center">
+  <img src="docs/readme/hero.svg" width="100%" alt="LinguaLens — 自带密钥的 Chrome 网页翻译插件" />
+</p>
 
-## 功能
+<p align="center">连接自己的 AI 服务，原地翻译网页。原文、译文、双语，随时切换。</p>
 
-- **原地翻译**：右键翻译选区或整页，保留链接、加粗与页面交互。
-- **双语对照**：保留原文，在每个自然段下方显示对应译文。
-- **流式输出**：按段落分批处理，实时显示译文，失败段落可单独重试。
-- **译文缓存**：原文、译文、双语直接切换，同一页面内复用已完成的译文。
-- **自带密钥**：支持兼容 OpenAI API 的服务，多套配置随时切换。
-- **忠实翻译**：默认约束不增译、不漏译，支持自定义 Prompt 与目标语言。
+<p align="center">
+  <a href="https://github.com/wangshub/lingualens/actions/workflows/ci.yml"><img src="https://github.com/wangshub/lingualens/actions/workflows/ci.yml/badge.svg" alt="CI 构建状态" /></a>
+  <a href="https://github.com/wangshub/lingualens/releases/latest"><img src="https://img.shields.io/github/v/release/wangshub/lingualens?color=2563eb&amp;label=release" alt="最新发布版本" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-64748b" alt="MIT 开源协议" /></a>
+</p>
 
-<details>
-<summary>界面预览</summary>
+<p align="center">
+  <a href="https://github.com/wangshub/lingualens/releases/latest"><strong>下载安装包</strong></a> ·
+  <a href="#开始使用">开始使用</a> ·
+  <a href="docs/CONFIGURATION.md">配置指南</a> ·
+  <a href="docs/RELEASING.md">发布指南</a>
+</p>
 
-| 设置页面 | 插件弹窗 |
-| --- | --- |
-| <img src="docs/screenshots/options.png" width="640" alt="模型与翻译设置" /> | <img src="docs/screenshots/popup.png" width="300" alt="翻译弹窗" /> |
+![LinguaLens 双语对照：每段原文下方显示译文，页面浮层可切换显示方式](docs/readme/bilingual.jpg)
 
-![双语对照](docs/screenshots/bilingual.png)
+<sub>真实插件界面；演示页面通过本地模拟 API 返回预设译文，用于展示排版与交互。</sub>
 
-截图使用本地模拟 API 与测试配置。
+## 为阅读而设计
 
-</details>
+- **原地翻译**：右键翻译选区或整页，保留链接、加粗和页面交互。
+- **双语对照**：译文显示在每个自然段下方，随时切回原文或纯译文。
+- **译文缓存**：同一页面内切换显示方式直接复用结果，无需再次请求模型；刷新后清除。
+- **流式输出**：按段落分批处理，实时显示译文，失败段落保留原文并支持单独重试。
+- **自带密钥**：兼容 OpenAI 格式的 API，支持多套模型配置、目标语言和自定义 Prompt。
 
-## 安装
+默认 Prompt 要求忠实原文、不增译、不漏译；实际翻译质量取决于模型与指令。
 
-需要 **Node.js 22.12+**、**pnpm 10.15.1** 和 **Chrome 123+**。
+## 开始使用
 
-```bash
-git clone https://github.com/wangshub/lingualens.git
-cd lingualens
-pnpm install --frozen-lockfile
-pnpm build
-```
+需要 **Chrome 123+**。目前请通过发布包安装：
 
-打开 `chrome://extensions`，启用「开发者模式」，选择「加载已解压的扩展程序」，加载 `.output/chrome-mv3/`。
-
-Chrome Web Store 版本尚未发布。获取发布包后，也可将 ZIP 解压并按上述方式加载。
-
-## 配置
-
-打开插件设置，填写 **API Base URL、API Key、模型名称**，选择目标语言，测试连接后保存。
+1. 从 [最新 Release](https://github.com/wangshub/lingualens/releases/latest) 下载 `lingualens-版本号-chrome.zip` 并解压。
+2. 打开 `chrome://extensions`，启用「开发者模式」，点击「加载已解压的扩展程序」，选择包含 `manifest.json` 的目录。
+3. 打开插件设置，填写 API Base URL、API Key 和模型名称，选择目标语言，测试连接后保存。
+4. 在网页中右键翻译选区或整页，用弹窗或页面浮层切换原文、译文和双语对照。
 
 | 服务 | API Base URL | 示例模型 |
 | --- | --- | --- |
@@ -56,33 +47,41 @@ Chrome Web Store 版本尚未发布。获取发布包后，也可将 ZIP 解压�
 | Moonshot | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
 | Ollama | `http://localhost:11434/v1` | `qwen3:8b` |
 
-模型名称以服务商实际可用列表为准；Ollama 等免鉴权服务可留空 API Key。密钥仅保存在浏览器本地，翻译文本发送至所配置的服务。
+模型名称以服务商可用列表为准；免鉴权服务可留空 API Key。密钥保存在浏览器本地，翻译文本仅发送至配置的服务。更多设置见 [配置指南](docs/CONFIGURATION.md) 和 [隐私说明](PRIVACY.md)。
 
-选中文字后右键「翻译选中内容」；在页面空白处右键翻译整页或开启双语对照。弹窗和页面浮层可切换原文、译文、双语，重新翻译使用独立按钮。
+<details>
+<summary>查看模型设置与插件弹窗</summary>
 
-Prompt、并发、错误处理与支持范围见 [配置指南](docs/CONFIGURATION.md)。
+![模型与翻译设置，使用本地模拟 API 与测试配置](docs/screenshots/options.png)
 
-## 开发
+<img src="docs/screenshots/popup.png" width="360" alt="插件弹窗：模型选择、目标语言与翻译操作" />
 
-基于 **WXT · Manifest V3 · TypeScript · React · Tailwind CSS**。
+</details>
+
+## 本地开发
+
+基于 **WXT · Manifest V3 · TypeScript · React · Tailwind CSS**。需要 Node.js 22.12+ 和 pnpm 10.15.1。
 
 ```bash
+git clone https://github.com/wangshub/lingualens.git
+cd lingualens
+pnpm install --frozen-lockfile
 pnpm dev        # 热更新，加载 .output/chrome-mv3-dev/
 pnpm check      # 类型检查、Lint、单元测试、构建
 pnpm zip        # 生成安装 ZIP
 ```
 
-项目结构、浏览器测试和调试方式见 [开发指南](docs/DEVELOPMENT.md)。
+项目结构与浏览器调试见 [开发指南](docs/DEVELOPMENT.md)。
 
-## 发布
+## 版本发布
 
-修改提交后，更新版本并推送标签：
+提交修改后执行：
 
 ```bash
 npm version patch && git push --follow-tags
 ```
 
-GitHub Actions 自动检查、打包并创建 Release；配置商店凭据后通过 V2 API 提交 Chrome Web Store 审核。首次上架、CLI 授权与 Secrets 配置见 [发布指南](docs/RELEASING.md)。
+GitHub Actions 自动检查、打包并创建 Release；配置商店凭据后，通过 V2 API 提交 Chrome Web Store 审核。首次上架、OAuth 授权和 Secrets 配置见 [发布指南](docs/RELEASING.md)。
 
 ---
 
