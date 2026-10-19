@@ -45,4 +45,4 @@ pnpm zip
 npm version patch && git push --follow-tags
 ```
 
-安装步骤见 [README](../README.md#安装)，开发调试见 [开发指南](DEVELOPMENT.md)，Chrome Web Store 凭据与版本发布见 [发布指南](RELEASING.md)。真实测试结果与未验证的边界见 [verification.md](verification.md)。
+安装步骤见 [README](../README.md#开始使用)，开发调试见 [开发指南](DEVELOPMENT.md)，Chrome Web Store 凭据与版本发布见 [发布指南](RELEASING.md)。真实测试结果与未验证的边界见 [verification.md](verification.md)。

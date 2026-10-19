@@ -2,7 +2,8 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
 const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
-const tag = process.env.GITHUB_REF_NAME;
+// Branch and PR names must not be interpreted as release tags.
+const tag = process.env.GITHUB_REF_TYPE === 'tag' ? process.env.GITHUB_REF_NAME : undefined;
 if (tag) {
   assert.match(tag, /^v\d+\.\d+\.\d+$/, 'Release tag must have the form v1.2.3');
   assert.equal(tag, `v${pkg.version}`, 'Tag and package.json version do not match');

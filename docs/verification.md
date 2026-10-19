@@ -2,6 +2,15 @@
 
 日期：2026-10-16。环境：Node.js 22.22.0、pnpm 10.15.1、WXT 0.20.27、TypeScript 5.9.3、React 19.3.1、Tailwind CSS 4.3.3、Playwright Chromium 156.0.8078.4。
 
+## 2026-10-19 商店上架后的文档与发布流程
+
+- 公开 [商店页面](https://chromewebstore.google.com/detail/lingualens/aahmiimoiagmedkmnogojilladlfecgg?hl=zh-cn) 显示版本 1.0.1、上次更新 2026-10-18；核验时 GitHub 最新 Release 为 v1.1.0。README 以商店安装为主入口，保留 ZIP 安装，并区分两个发布渠道。
+- CI 构建后校验 package 与 Manifest V3 版本；版本检查只在 tag 事件比较发布标签，不将 main 或 PR 分支名当作版本号。
+- CD 增加默认只读的 `check` 与指定已有 Release 的 `submit` 手动入口。后者复用原 ZIP，校验包内 manifest，检查目标版本及现有审核；不会取消现有提交或覆盖 GitHub 同名 ZIP。缺少凭据时明确失败，GitHub Release 保留。
+- 本地 TypeScript、Lint、90 项测试和生产构建通过。53 项发布工具测试使用虚构凭据，覆盖数字版本比较、重复提交、降级阻止、部分渠道冲突、缺失版本、已有审核与已完成提交、下架、认证保密及状态文案。
+- actionlint 1.7.12、YAML、内嵌 Bash 与 ZIP 提取 Python 检查通过。实际运行工作流预检，确认缺少 Secrets 和无效标签返回失败，完整虚构配置可进入只读操作；从现有 v1.1.0 ZIP 提取并校验 manifest 成功。
+- README 本地链接、图片与 SVG 审查通过，已查看桌面和手机预览；深浅色下无页面横向溢出或缺失图片。本轮只更新发布工具，不上传 ZIP 或提交新商店版本；真实认证检查以 Actions 的 `check` 摘要为准。
+
 ## 2026-10-17 发布 CLI 与 V2 API
 
 - 新发布脚本直接使用 Chrome Web Store V2，保留用户 OAuth 客户端和 refresh token 认证，增加 V2 必需的 Publisher ID 配置。Google 公布的 [V1 支持截止日](https://developer.chrome.com/docs/webstore/api/v1) 为 2026-10-15；原 WXT 发布依赖仍调用 V1，因此 CI 改为运行独立脚本。

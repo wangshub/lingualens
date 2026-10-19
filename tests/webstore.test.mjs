@@ -3,8 +3,10 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { refreshAccessToken, runWebstore, webstoreConfig } from '../scripts/chrome-webstore.mjs';
+import { compareVersions, describeWebstoreResult, refreshAccessToken, runWebstore as publishToWebstore, validateReleaseManifest, webstoreConfig } from '../scripts/chrome-webstore.mjs';
 import { storeWebstoreCredentials } from '../scripts/store-webstore-credentials.mjs';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 // All credentials and HTTP responses here are synthetic; no Google calls occur.
 const env = {
@@ -21,7 +23,9 @@ function server(...responses) {
   });
 }
 const token = () => json({ access_token: 'test-access-token' });
-const published = () => json({ publishedItemRevisionStatus: { state: 'PUBLISHED' } });
+const revision = (state, ...versions) => ({ state, distributionChannels: versions.map((crxVersion) => ({ crxVersion, deployPercentage: 100 })) });
+const published = () => json({ publishedItemRevisionStatus: revision('PUBLISHED', '1.0.1') });
+const runWebstore = (options) => publishToWebstore({ version: '1.1.0', ...options });
 let directory;
 let zipPath;
 beforeAll(async () => {
@@ -41,7 +45,7 @@ describe('Chrome Web Store V2 publishing', () => {
 
   it('checks ownership with V2 without uploading, cancelling or publishing', async () => {
     const fetchImpl = server(token(), json({ submittedItemRevisionStatus: { state: 'PENDING_REVIEW' } }));
-    expect(await runWebstore({ env, checkOnly: true, fetchImpl })).toEqual({ checked: true, published: undefined, submitted: 'PENDING_REVIEW' });
+    expect(await runWebstore({ env, checkOnly: true, fetchImpl })).toEqual({ checked: true, published: undefined, submitted: 'PENDING_REVIEW', publishedVersions: [], submittedVersions: [] });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(fetchImpl.mock.calls[1][0]).toBe(`${api}:fetchStatus`);
     expect(fetchImpl.mock.calls[1][1].headers.Authorization).toBe('Bearer test-access-token');
@@ -53,7 +57,7 @@ describe('Chrome Web Store V2 publishing', () => {
 
   it('uploads the ZIP to V2 and submits for normal review only after success', async () => {
     const fetchImpl = server(token(), published(), json({ uploadState: 'SUCCEEDED' }), json({ state: 'PENDING_REVIEW' }));
-    expect(await runWebstore({ env, zipPath, fetchImpl })).toEqual({ checked: false, state: 'PENDING_REVIEW' });
+    expect(await runWebstore({ env, zipPath, fetchImpl })).toEqual({ checked: false, skipped: false, version: '1.1.0', state: 'PENDING_REVIEW' });
     expect(fetchImpl.mock.calls[2][0]).toBe(api.replace('/v2/', '/upload/v2/') + ':upload');
     expect(fetchImpl.mock.calls[2][1].body).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
     expect(fetchImpl.mock.calls[3][0]).toBe(`${api}:publish`);
@@ -77,7 +81,7 @@ describe('Chrome Web Store V2 publishing', () => {
 
   it('accepts a read-only lookup without claiming missing revision fields mean no submission', async () => {
     const fetchImpl = server(token(), json({ itemId: env.CHROME_EXTENSION_ID, name: 'test-item', publicKey: 'synthetic-public-key' }));
-    expect(await runWebstore({ env, checkOnly: true, fetchImpl })).toEqual({ checked: true, published: undefined, submitted: undefined });
+    expect(await runWebstore({ env, checkOnly: true, fetchImpl })).toEqual({ checked: true, published: undefined, submitted: undefined, publishedVersions: [], submittedVersions: [] });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
@@ -100,6 +104,64 @@ describe('Chrome Web Store V2 publishing', () => {
     expect(fetchImpl.mock.calls.some(([url]) => url.endsWith(':publish'))).toBe(false);
   });
 
+  it('skips an already published version, including an implicit trailing zero', async () => {
+    const fetchImpl = server(token(), json({ publishedItemRevisionStatus: revision('PUBLISHED', '1.1.0.0') }));
+    expect(await runWebstore({ env, zipPath, fetchImpl })).toEqual({ checked: false, skipped: true, version: '1.1.0', state: 'PUBLISHED' });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['PENDING_REVIEW', 'STAGED', 'PUBLISHED_TO_TESTERS'])('recognizes the same %s version on retry without changing it', async (state) => {
+    const fetchImpl = server(token(), json({ publishedItemRevisionStatus: revision('PUBLISHED', '1.0.1'), submittedItemRevisionStatus: revision(state, '1.1.0') }));
+    expect(await runWebstore({ env, zipPath, fetchImpl })).toEqual({ checked: false, skipped: true, version: '1.1.0', state });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['PENDING_REVIEW', 'STAGED', 'PUBLISHED_TO_TESTERS'])('protects a different %s version from overwrite', async (state) => {
+    const fetchImpl = server(token(), json({ publishedItemRevisionStatus: revision('PUBLISHED', '1.0.1'), submittedItemRevisionStatus: revision(state, '1.2.0') }));
+    await expect(runWebstore({ env, zipPath, fetchImpl })).rejects.toThrow('处理现有提交');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a downgrade using numeric component order', async () => {
+    const fetchImpl = server(token(), json({ publishedItemRevisionStatus: revision('PUBLISHED', '1.10.0') }));
+    await expect(runWebstore({ env, zipPath, version: '1.9.0', fetchImpl })).rejects.toThrow('低于商店已发布版本');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('allows an update after a completed older submission instead of treating it as pending', async () => {
+    const fetchImpl = server(token(), json({ publishedItemRevisionStatus: revision('PUBLISHED', '1.0.1'), submittedItemRevisionStatus: revision('PUBLISHED', '1.0.1') }), json({ uploadState: 'SUCCEEDED' }), json({ state: 'PENDING_REVIEW' }));
+    expect((await runWebstore({ env, zipPath, fetchImpl })).skipped).toBe(false);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    { publishedItemRevisionStatus: { state: 'PUBLISHED' } },
+    { publishedItemRevisionStatus: revision('PUBLISHED', env.CHROME_CLIENT_SECRET) },
+    { publishedItemRevisionStatus: revision('UNKNOWN', '1.0.1') },
+    { publishedItemRevisionStatus: revision('PUBLISHED', '1.1.0', '1.0.1') },
+    { publishedItemRevisionStatus: revision('PUBLISHED', '1.0.1'), lastAsyncUploadState: 'IN_PROGRESS' },
+    { publishedItemRevisionStatus: revision('PUBLISHED', '1.0.1'), takenDown: true },
+  ])('stops when version information or store state does not allow an upload: %j', async (status) => {
+    const fetchImpl = server(token(), json(status));
+    await expect(runWebstore({ env, zipPath, fetchImpl })).rejects.toThrow('本次未上传文件');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires a valid target version before authenticating', async () => {
+    const fetchImpl = vi.fn();
+    await expect(publishToWebstore({ env, zipPath, fetchImpl })).rejects.toThrow('目标版本');
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('includes safe version information in a read-only query', async () => {
+    const fetchImpl = server(token(), json({ publishedItemRevisionStatus: revision('PUBLISHED', '1.0.1'), submittedItemRevisionStatus: revision('PENDING_REVIEW', '1.1.0') }));
+    const result = await runWebstore({ env, checkOnly: true, fetchImpl });
+    expect(result.publishedVersions).toEqual(['1.0.1']);
+    expect(result.submittedVersions).toEqual(['1.1.0']);
+    expect(describeWebstoreResult(result)).toContain('本次仅查询状态');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it('reports revoked refresh tokens without exposing the provider body', async () => {
     const fetchImpl = server(json({ error: 'invalid_grant', error_description: env.CHROME_REFRESH_TOKEN }, 400));
     await expect(refreshAccessToken(env, fetchImpl)).rejects.toThrow('重新获取 CHROME_REFRESH_TOKEN');
@@ -117,6 +179,47 @@ describe('Chrome Web Store V2 publishing', () => {
     await expect(refreshAccessToken(env, fetchImpl)).rejects.toThrow('网络连接失败或超时');
     const malformed = server(new Response(`not-json-${env.CHROME_REFRESH_TOKEN}`));
     await expect(refreshAccessToken(env, malformed)).rejects.toThrow('无法解析的响应');
+  });
+});
+
+describe('Release versions and result reporting', () => {
+  it('verifies the exact manifest version and Manifest V3 before upload', () => {
+    expect(validateReleaseManifest({ manifest_version: 3, version: '1.1.0' }, 'v1.1.0')).toBe('1.1.0');
+    expect(() => validateReleaseManifest({ manifest_version: 3, version: '1.0.1' }, 'v1.1.0')).toThrow('manifest');
+    expect(() => validateReleaseManifest({ manifest_version: 2, version: '1.1.0' }, 'v1.1.0')).toThrow('Manifest V3');
+  });
+
+  it.each(['main', 'v1.1.0-beta', 'v01.1.0', 'v65536.0.0', 'v0.0.0', 'v1.2.3\n'])('rejects invalid release tag %j', (tag) => {
+    expect(() => validateReleaseManifest({ manifest_version: 3, version: '1.1.0' }, tag)).toThrow('Release tag');
+  });
+
+  it('compares the four numeric Chrome version components', () => {
+    expect(compareVersions('1.10.0', '1.9.0')).toBe(1);
+    expect(compareVersions('1.0.0', '1')).toBe(0);
+    expect(compareVersions('1.0.0.1', '1.0.0')).toBe(1);
+    expect(() => compareVersions('1.0.0-beta', '1')).toThrow('格式无效');
+  });
+
+  it('never labels a pending or tester-only submission as publicly published', () => {
+    expect(describeWebstoreResult({ state: 'PENDING_REVIEW', version: '1.1.0' })).toContain('审核通过后');
+    expect(describeWebstoreResult({ state: 'PUBLISHED_TO_TESTERS', version: '1.1.0' })).toContain('尚未公开发布');
+    expect(describeWebstoreResult({ state: 'STAGED', version: '1.1.0', skipped: true })).toContain('等待在商店控制台发布');
+    expect(describeWebstoreResult({ state: 'PUBLISHED', version: '1.1.0', skipped: true })).toContain('本次未重复上传');
+    const message = describeWebstoreResult({ checked: true, published: env.CHROME_CLIENT_SECRET, publishedVersions: [env.CHROME_REFRESH_TOKEN] });
+    expect(message).not.toContain(env.CHROME_CLIENT_SECRET);
+    expect(message).not.toContain(env.CHROME_REFRESH_TOKEN);
+  });
+
+  it.each([['branch', 'main'], ['branch', 'feature/new-install'], ['branch', '12/merge']])('accepts CI ref type %s name %s', (type, name) => {
+    const result = spawnSync(process.execPath, ['scripts/check-version.mjs'], { encoding: 'utf8', env: { ...process.env, GITHUB_REF_TYPE: type, GITHUB_REF_NAME: name } });
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  it('still rejects a release tag that differs from package.json', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    const run = (tag) => spawnSync(process.execPath, ['scripts/check-version.mjs'], { encoding: 'utf8', env: { ...process.env, GITHUB_REF_TYPE: 'tag', GITHUB_REF_NAME: tag } });
+    expect(run(`v${pkg.version}`).status).toBe(0);
+    expect(run('v65535.65535.65535').status).not.toBe(0);
   });
 });
 

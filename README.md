@@ -6,15 +6,14 @@
 
 <p align="center">
   <a href="https://github.com/wangshub/lingualens/actions/workflows/ci.yml"><img src="https://github.com/wangshub/lingualens/actions/workflows/ci.yml/badge.svg" alt="CI 构建状态" /></a>
-  <a href="https://github.com/wangshub/lingualens/releases/latest"><img src="https://img.shields.io/github/v/release/wangshub/lingualens?color=2563eb&amp;label=release" alt="最新发布版本" /></a>
+  <a href="https://github.com/wangshub/lingualens/releases/latest"><img src="https://img.shields.io/github/v/release/wangshub/lingualens?color=2563eb&amp;label=GitHub" alt="GitHub 最新发行版本" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-64748b" alt="MIT 开源协议" /></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/wangshub/lingualens/releases/latest"><strong>下载安装包</strong></a> ·
-  <a href="#开始使用">开始使用</a> ·
-  <a href="docs/CONFIGURATION.md">配置指南</a> ·
-  <a href="docs/RELEASING.md">发布指南</a>
+  <a href="https://chromewebstore.google.com/detail/lingualens/aahmiimoiagmedkmnogojilladlfecgg?hl=zh-cn"><strong>添加至 Chrome</strong></a> ·
+  <a href="https://github.com/wangshub/lingualens/releases/latest">下载 ZIP</a> ·
+  <a href="docs/CONFIGURATION.md">配置指南</a>
 </p>
 
 ![LinguaLens 双语对照：每段原文下方显示译文，页面浮层可切换显示方式](docs/readme/bilingual.jpg)
@@ -33,12 +32,13 @@
 
 ## 开始使用
 
-需要 **Chrome 123+**。目前请通过发布包安装：
+需要 **Chrome 123+**。
 
-1. 从 [最新 Release](https://github.com/wangshub/lingualens/releases/latest) 下载 `lingualens-版本号-chrome.zip` 并解压。
-2. 打开 `chrome://extensions`，启用「开发者模式」，点击「加载已解压的扩展程序」，选择包含 `manifest.json` 的目录。
-3. 打开插件设置，填写 API Base URL、API Key 和模型名称，选择目标语言，测试连接后保存。
-4. 在网页中右键翻译选区或整页，用弹窗或页面浮层切换原文、译文和双语对照。
+1. 在 [Chrome 应用商店](https://chromewebstore.google.com/detail/lingualens/aahmiimoiagmedkmnogojilladlfecgg?hl=zh-cn) 点击「添加至 Chrome」，安装后固定插件图标。
+2. 打开插件设置，填写 API Base URL、API Key 和模型名称，选择目标语言，测试连接后保存。
+3. 在网页中右键翻译选区或整页，用弹窗或页面浮层切换原文、译文和双语对照。
+
+手动安装可下载 [GitHub Release ZIP](https://github.com/wangshub/lingualens/releases/latest)，解压后在 `chrome://extensions` 开启开发者模式，加载包含 `manifest.json` 的目录。商店版本经过审核后更新，可能晚于 GitHub Release。
 
 | 服务 | API Base URL | 示例模型 |
 | --- | --- | --- |
@@ -81,7 +81,7 @@ pnpm zip        # 生成安装 ZIP
 npm version patch && git push --follow-tags
 ```
 
-GitHub Actions 自动检查、打包并创建 Release；配置商店凭据后，通过 V2 API 提交 Chrome Web Store 审核。首次上架、OAuth 授权和 Secrets 配置见 [发布指南](docs/RELEASING.md)。
+GitHub Actions 自动检查、生成 ZIP 与 GitHub Release，再通过 V2 API 提交商店更新，审核通过后自动发布。支持从 Actions 检查商店状态或重新提交指定 Release；版本保护、OAuth 与 Secrets 配置见 [发布指南](docs/RELEASING.md)。
 
 ---
 

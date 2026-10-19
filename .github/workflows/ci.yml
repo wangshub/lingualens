@@ -35,6 +35,8 @@ jobs:
         run: pnpm test
       - name: Build Chrome extension
         run: pnpm exec wxt build
+      - name: Verify generated manifest version
+        run: node scripts/check-version.mjs --manifest
       - name: Upload unpacked extension for review
         uses: actions/upload-artifact@v4
         with:

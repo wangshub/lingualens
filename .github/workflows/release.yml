@@ -3,17 +3,35 @@ name: Release
 on:
   push:
     tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'check 只查询状态；submit 提交已有 GitHub Release'
+        type: choice
+        options: [check, submit]
+        default: check
+        required: true
+      tag:
+        description: 'submit 必填：已有 Release 标签，例如 v1.1.0'
+        type: string
+        required: false
 
 permissions:
   contents: read
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  WEBSTORE_ACTION: ${{ github.event_name == 'workflow_dispatch' && inputs.action || 'submit' }}
+
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}-${{ inputs.action || 'submit' }}
   cancel-in-progress: false
 
 jobs:
   release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
@@ -36,34 +54,43 @@ jobs:
         run: pnpm exec wxt zip
       - name: Verify generated manifest version
         run: node scripts/check-version.mjs --manifest
-      - name: Keep zip for the publishing job
+      - name: Keep build ZIP as an artifact
         uses: actions/upload-artifact@v4
         with:
           name: chrome-release-zip
           path: .output/*-chrome.zip
-          # WXT places the ZIP inside a hidden directory.
           include-hidden-files: true
           if-no-files-found: error
-      - name: Create GitHub Release with automatic changelog
+          retention-days: 14
+      - name: Create GitHub Release without replacing an existing ZIP
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          asset="lingualens-${GITHUB_REF_NAME#v}-chrome.zip"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" .output/*-chrome.zip --clobber
+            existing="$(gh release view "$GITHUB_REF_NAME" --json assets --jq ".assets[] | select(.name == \"$asset\") | .name")"
+            if [ -z "$existing" ]; then
+              gh release upload "$GITHUB_REF_NAME" ".output/$asset"
+            else
+              echo "Keeping the original GitHub Release ZIP."
+            fi
           else
-            gh release create "$GITHUB_REF_NAME" .output/*-chrome.zip --verify-tag --generate-notes --title "LinguaLens $GITHUB_REF_NAME"
+            gh release create "$GITHUB_REF_NAME" ".output/$asset" --verify-tag --generate-notes --title "LinguaLens $GITHUB_REF_NAME"
           fi
+          echo "### GitHub Release" >> "$GITHUB_STEP_SUMMARY"
+          echo "[LinguaLens $GITHUB_REF_NAME](https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME) — ZIP available; Chrome Web Store submission is a separate job." >> "$GITHUB_STEP_SUMMARY"
 
   webstore:
     needs: release
+    # Manual status/retry runs intentionally skip the build/Release job.
+    if: ${{ !cancelled() && (needs.release.result == 'success' || (github.event_name == 'workflow_dispatch' && needs.release.result == 'skipped')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
       group: chrome-web-store-${{ github.repository }}
       cancel-in-progress: false
     steps:
-      - name: Check Chrome Web Store secrets
-        id: credentials
+      - name: Validate operation and required secrets
         env:
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
           CHROME_PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
@@ -71,36 +98,71 @@ jobs:
           CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
           CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
         run: |
-          if [ -n "$CHROME_EXTENSION_ID" ] && [ -n "$CHROME_PUBLISHER_ID" ] && [ -n "$CHROME_CLIENT_ID" ] && [ -n "$CHROME_CLIENT_SECRET" ] && [ -n "$CHROME_REFRESH_TOKEN" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Chrome Web Store publishing skipped: configure CHROME_EXTENSION_ID, CHROME_PUBLISHER_ID and the three CHROME_* OAuth secrets."
-            echo "### Chrome Web Store publishing skipped" >> "$GITHUB_STEP_SUMMARY"
-            echo "GitHub Release was created. Configure the five CHROME_* secrets documented in docs/RELEASING.md, then rerun this job." >> "$GITHUB_STEP_SUMMARY"
+          case "$WEBSTORE_ACTION" in
+            check) ;;
+            submit)
+              if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "::error::submit requires an existing vX.Y.Z Release tag."
+                exit 1
+              fi
+              ;;
+            *) echo "::error::Unknown Web Store operation."; exit 1 ;;
+          esac
+          missing=()
+          for key in CHROME_EXTENSION_ID CHROME_PUBLISHER_ID CHROME_CLIENT_ID CHROME_CLIENT_SECRET CHROME_REFRESH_TOKEN; do
+            if [ -z "${!key}" ]; then missing+=("$key"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required repository secrets: ${missing[*]}"
+            echo "### Chrome Web Store task failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Configure the five CHROME_* secrets in docs/RELEASING.md, then retry. Any GitHub Release already created is retained." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
-      - uses: actions/checkout@v4
-        if: steps.credentials.outputs.ready == 'true'
-      - uses: pnpm/action-setup@v4
-        if: steps.credentials.outputs.ready == 'true'
+      - name: Checkout the publishing tools used by this workflow
+        uses: actions/checkout@v4
+        with:
+          # A manual retry of an old Release must use the current workflow tools.
+          ref: ${{ github.workflow_sha }}
       - uses: actions/setup-node@v4
-        if: steps.credentials.outputs.ready == 'true'
         with:
           node-version: 22
-          cache: pnpm
-      - if: steps.credentials.outputs.ready == 'true'
-        run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        if: steps.credentials.outputs.ready == 'true'
-        with:
-          name: chrome-release-zip
-          path: .output
-      - name: Upload and submit with Chrome Web Store API V2
-        if: steps.credentials.outputs.ready == 'true'
-        run: node scripts/chrome-webstore.mjs .output/*-chrome.zip
+      - name: Download the original GitHub Release ZIP and extract its manifest
+        if: env.WEBSTORE_ACTION == 'submit'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease')" != "false" ]; then
+            echo "::error::Only a published stable GitHub Release may be submitted."
+            exit 1
+          fi
+          gh release download "$RELEASE_TAG" --pattern "lingualens-${RELEASE_TAG#v}-chrome.zip" --dir .output
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+          archive = Path('.output') / f"lingualens-{os.environ['RELEASE_TAG'][1:]}-chrome.zip"
+          with ZipFile(archive) as package:
+              entries = [info for info in package.infolist() if info.filename == 'manifest.json']
+              if len(entries) != 1 or entries[0].file_size > 1024 * 1024:
+                  raise SystemExit('Release ZIP must contain exactly one root manifest.json, at most 1 MiB.')
+              Path('.output/release-manifest.json').write_bytes(package.read(entries[0]))
+          PY
+      - name: Check status or submit the validated Release
         env:
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
           CHROME_PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
           CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
           CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
           CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+        run: |
+          if [ "$WEBSTORE_ACTION" = "check" ]; then
+            node scripts/chrome-webstore.mjs --check
+          else
+            node scripts/chrome-webstore.mjs ".output/lingualens-${RELEASE_TAG#v}-chrome.zip" --manifest .output/release-manifest.json --tag "$RELEASE_TAG"
+          fi
+      - name: Link to publishing results on failure
+        if: failure()
+        run: |
+          echo "### Chrome Web Store task failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "See the failed step above. Existing GitHub Releases and pending store submissions were not cancelled." >> "$GITHUB_STEP_SUMMARY"
+          echo "[Developer dashboard](https://chrome.google.com/webstore/devconsole/) · [Published listing](https://chromewebstore.google.com/detail/lingualens/aahmiimoiagmedkmnogojilladlfecgg)" >> "$GITHUB_STEP_SUMMARY"
